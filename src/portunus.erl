@@ -1,0 +1,830 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2026 Team RabbitMQ <teamrabbitmq@gmail.com>. All Rights Reserved.
+%%
+-module(portunus).
+-moduledoc """
+The primary API of the `portunus` lock server. Its shape is inspired by
+`ra`'s own API.
+
+Lifecycle functions take a `name()` when they act on the local node
+(`restart_server/2`, `join_or_form/3`) and a `server_id()` when they can
+target any member's replica (`reset_server/2`).
+""".
+
+%% Cluster lifecycle.
+-export([start_system/2,
+         ensure_started/1,
+         start_cluster/3,
+         join_cluster/3,
+         join_or_form/3,
+         reset_and_join_cluster/3,
+         restart_server/2,
+         add_member/2,
+         remove_member/2,
+         reset_server/2,
+         members/1]).
+
+%% Leases.
+-export([grant_lease/2, grant_lease/3,
+         renew_leases/2, renew_leases/3,
+         revoke_lease/2,
+         keep_alive/3]).
+
+%% Locks.
+-export([acquire/4, acquire/5,
+         acquire_or_join_succession_queue/4,
+         acquire_or_join_succession_queue/5,
+         release/3,
+         owner/2]).
+
+%% Watch.
+-export([watch/2, unwatch/2]).
+
+%% Health and introspection.
+-export([has_quorum/1, is_member/1, status/1]).
+
+%% Conveniences.
+-export([lock/3, unlock/1, with_lock/4]).
+
+-include("portunus.hrl").
+
+-define(CMD_TIMEOUT, 5000).
+
+-type name() :: atom().
+-type system() :: atom().
+-type lock_key() :: portunus_machine:lock_key().
+-type lease_id() :: portunus_machine:lease_id().
+-type token() :: portunus_machine:token().
+-type owner() :: portunus_machine:owner().
+-type ttl() :: pos_integer().
+-type server_id() :: ra:server_id().
+
+%% The current holder of a lock, as reported by `owner/2`.
+-type owner_info() :: portunus_machine:owner_info().
+
+%% `acquire_or_join_succession_queue/5` options. `affinity` decides which
+%% contender is promoted first (see `portunus_affinity`); the default is FIFO.
+%% `context` is attached to the grant on promotion, exactly as `acquire/5`
+%% attaches it to an "immediate" grant.
+-type succession_opts() :: #{affinity => portunus_affinity:spec(),
+                             context => term()}.
+
+%% A watch registration handle from `watch/2`, passed to `unwatch/2` to stop watching.
+%% Current Raft indices are used as watch references.
+-type watch_ref() :: portunus_machine:watch_ref().
+
+%% `grant_lease/3` options: `auto_renew` attaches a holder-linked renewer
+%% so the lease lives as long as the caller.
+%% See `portunus_keepalive`.
+-type grant_opts() :: #{proposed_id => lease_id(), auto_renew => boolean()}.
+
+%% `ensure_started/1` environment: every key is optional and defaulted.
+-type env() :: #{ra_system => system(),
+                 name => name(),
+                 data_dir => file:filename_all(),
+                 membership => [node()] | {module(), atom()} | local}.
+
+%% `status/1`: leader, members and quorum are always present; the machine-derived
+%% counts are absent if the status query could not be served.
+-type status() :: #{leader := option(server_id()),
+                    members := [server_id()],
+                    quorum := boolean(),
+                    leases => non_neg_integer(),
+                    locks => non_neg_integer(),
+                    waiters => non_neg_integer(),
+                    watchers => non_neg_integer(),
+                    fencing_token => non_neg_integer()}.
+
+%% Errors: any command may yield `no_quorum`, meaning there was no online Raft quorum.
+-type lease_error()   :: id_in_use | no_quorum.
+-type acquire_error() :: {held_by, owner()} | lease_expired | no_quorum.
+-type release_error() :: not_owner | not_held | no_quorum.
+
+%% The result shape of every command that carries no value.
+-type ok_or_error(E) :: ok | {error, E}.
+
+%% A value that may be absent.
+-type option(T) :: T | undefined.
+
+%% Returned by `lock/3`, consumed by `unlock/1`: opaque on purpose, so
+%% callers treat it as a token rather than a map to destructure.
+-opaque handle() :: #{name := name(), key := lock_key(), lease := lease_id(),
+                      token := token(), renewer := pid()}.
+
+-export_type([name/0, system/0, lock_key/0, lease_id/0, token/0, owner/0,
+              ttl/0, server_id/0, owner_info/0, succession_opts/0, watch_ref/0,
+              grant_opts/0, env/0, status/0, lease_error/0, acquire_error/0,
+              release_error/0, ok_or_error/1, option/1, handle/0]).
+
+%%
+%% Cluster lifecycle
+%%
+
+-doc """
+Start a dedicated Ra system to use for `portunus`. Idempotent, and safe to call
+again after the `ra` application has been restarted.
+""".
+-spec start_system(system(), file:filename_all()) -> ok_or_error(term()).
+start_system(System, DataDir) ->
+    maybe
+        {ok, _} ?= application:ensure_all_started(ra),
+        {ok, _} ?= application:ensure_all_started(seshat),
+        %% The portunus app owns node-global state for the node's lifetime: it
+        %% initialises the counters and, through `portunus_sup`, owns the
+        %% delayed-restart marker table.
+        {ok, _} ?= application:ensure_all_started(portunus),
+        Config = (ra_system:default_config())#{
+                   name => System,
+                   data_dir => DataDir,
+                   names => ra_system:derive_names(System)},
+        ensure_system_started(System, Config)
+    else
+        {error, _} = Err -> Err
+    end.
+
+%% Always go through `ra_system:start/1`: it re-creates the system, and
+%% recovers its servers from disk, whenever the `ra` application has been
+%% restarted. Guarding on `ra_system:fetch/1` instead would skip that, because
+%% its config lives in a persistent_term that outlives the system's processes,
+%% so a restarted system looks present while its ETS tables are gone.
+%% `already_present` is a child spec left by a torn-down system: drop it and
+%% start again.
+ensure_system_started(System, Config) ->
+    case ra_system:start(Config) of
+        {error, already_present} ->
+            _ = ra_system:stop(System),
+            started(ra_system:start(Config));
+        Result ->
+            started(Result)
+    end.
+
+%% Map a `supervisor:startchild_ret()` to ok: a freshly started system, an
+%% already-running one, or an error to propagate.
+-spec started(supervisor:startchild_ret()) -> ok_or_error(term()).
+started({ok, _}) -> ok;
+started({ok, _, _}) -> ok;
+started({error, {already_started, _}}) -> ok;
+started({error, _} = Err) -> Err.
+
+-doc """
+Form (or join) a single cluster-wide portunus cluster from an `Env`
+map. Every member runs a replica.
+
+This forms across all `membership` nodes at once, for a coordinated start where
+they come up together. For nodes that bootstrap independently, each running its
+own retry loop, use `join_or_form/3` instead.
+""".
+-spec ensure_started(env()) ->
+    {ok, [server_id()], [server_id()]} | {error, term()}.
+ensure_started(Env) ->
+    System = maps:get(ra_system, Env, portunus),
+    Name = maps:get(name, Env, portunus),
+    DataDir = maps:get(data_dir, Env, default_data_dir(System)),
+    Nodes = resolve_membership(maps:get(membership, Env, [node()])),
+    maybe
+        ok ?= start_system(System, DataDir),
+        start_cluster(System, Name, Nodes)
+    else
+        {error, _} = Err -> Err
+    end.
+
+-doc """
+Start a portunus Ra cluster named `Name` across `Nodes`. Ra registers each
+node's server locally under `Name`, so `Name` must not collide with another
+registered process: a local collision is reported as
+`{error, {name_registered, Pid}}` rather than left to surface as
+`cluster_not_formed`.
+""".
+-spec start_cluster(system(), name(), [node()]) ->
+    {ok, [server_id()], [server_id()]} | {error, term()}.
+start_cluster(System, Name, Nodes) ->
+    case ensure_name_unregistered(System, Name) of
+        ok ->
+            ServerIds = [{Name, N} || N <- Nodes],
+            ra:start_cluster(System, Name, machine(Name), ServerIds);
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc """
+Start a local server and join the existing cluster that `SeedNode`
+belongs to. The local Ra system must already be running (`start_system`).
+Idempotent: succeeds if this node is already a member. As in `start_cluster/3`,
+the cluster `Name` is registered locally, so a collision with another registered
+process is reported as `{error, {name_registered, Pid}}`.
+""".
+-spec join_cluster(system(), name(), node()) -> ok_or_error(term()).
+join_cluster(System, Name, SeedNode) ->
+    case ensure_name_unregistered(System, Name) of
+        ok ->
+            join_cluster1(System, Name, SeedNode);
+        {error, _} = Err ->
+            Err
+    end.
+
+join_cluster1(System, Name, SeedNode) ->
+    case ra:members({Name, SeedNode}, ?CMD_TIMEOUT) of
+        {ok, Members, Leader} ->
+            ServerId = {Name, node()},
+            case lists:member(ServerId, Members) of
+                true ->
+                    ok;
+                false ->
+                    case ensure_local_server(System, Name, ServerId, Members) of
+                        ok -> add_self(Leader, ServerId);
+                        {error, _} = Err -> Err
+                    end
+            end;
+        {timeout, _} = T ->
+            {error, T};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% A server left by an earlier join attempt whose `add_member` failed (a
+%% concurrent join, a leader-change timeout) is fine: proceed to the
+%% idempotent `add_member`, or every later retry wedges on `already_started`.
+%% `ra_directory` decides "exists locally"; matching `ra:start_server`'s
+%% error shapes would tie this to supervisor internals.
+ensure_local_server(System, Name, ServerId, Members) ->
+    case is_ra_server(System, Name) of
+        true ->
+            case whereis(Name) of
+                undefined -> restart_server(System, Name);
+                _ -> ok
+            end;
+        false ->
+            ra:start_server(System, Name, ServerId, machine(Name), Members)
+    end.
+
+add_self(Leader, ServerId) ->
+    case ra:add_member(Leader, ServerId) of
+        {ok, _, _} -> ok;
+        {error, already_member} -> ok;
+        {timeout, _} = T -> {error, T};
+        {error, _} = Err -> Err
+    end.
+
+-doc """
+Reset this node's replica of cluster `Name` and join the cluster that `SeedNode`
+belongs to. Unlike `join_cluster/3`, this first wipes any existing local replica,
+so a node that formed its own single-node cluster on boot can be merged into an
+existing cluster rather than colliding with it. This mirrors the reset-then-join
+a host performs when a standalone node joins a cluster: each node boots its own
+single-node cluster, and merging happens on the explicit join, so concurrent
+boots never split-form. The local replica's state is discarded, so call this
+during cluster formation, before the node holds any leases worth keeping.
+""".
+-spec reset_and_join_cluster(system(), name(), node()) -> ok_or_error(term()).
+reset_and_join_cluster(System, Name, SeedNode) ->
+    ServerId = {Name, node()},
+    _ = ra:stop_server(System, ServerId),
+    _ = ra:force_delete_server(System, ServerId),
+    join_cluster(System, Name, SeedNode).
+
+-doc """
+Restart this node's replica of cluster `Name`, recovering its state from disk.
+Use after the `ra` application or the node restarted: `start_system/2` rebuilds
+the Ra system but does not bring back the servers, so a member rejoins by
+restarting its replica. Idempotent: ok if the replica is already running.
+Returns `{error, name_not_registered}` if this node has no on-disk replica of
+`Name`, in which case it was never a member and should `start_cluster/3` or
+`join_cluster/3` instead.
+""".
+-spec restart_server(system(), name()) -> ok_or_error(term()).
+restart_server(System, Name) ->
+    case ra:restart_server(System, {Name, node()}) of
+        ok -> ok;
+        {error, {already_started, _}} -> ok;
+        Err -> Err
+    end.
+
+-doc """
+Bring this node into cluster `Name` from a host's bootstrap retry loop: recover
+an existing on-disk replica if there is one, otherwise the lowest node in
+`Members` forms a single-node cluster and every other node joins it.
+
+`Members` is the stable cluster-wide membership including this node, so every
+node picks the same seed and two nodes can never each form their own cluster (a
+split). A single-node form has no remote dependency, and a join simply retries
+until the seed is up, so this is the bootstrap to run rather than forming across
+several nodes at once, which races their Ra systems coming up. Call
+`start_system/2` first, gate work on `is_member/1`, and call this from a retry
+loop until that holds. Idempotent. See `ensure_started/1` for a coordinated
+start where all members come up together.
+""".
+-spec join_or_form(system(), name(), [node()]) -> ok_or_error(term()).
+join_or_form(System, Name, Members) when is_list(Members), Members =/= [] ->
+    case restart_server(System, Name) of
+        ok ->
+            case is_member(Name) of
+                true ->
+                    %% `restart_server` recovers the replica but, unlike
+                    %% `start_cluster`, does not trigger an election. A recovered
+                    %% single-member cluster has no peer to elect it, so it would
+                    %% sit leaderless after a full node restart. Nudge it. A
+                    %% multi-member cluster re-elects among its peers and must not
+                    %% be forced, so this is scoped to the sole-member case.
+                    maybe_trigger_sole_member_election(Name, Members),
+                    ok;
+                false ->
+                    %% A local server exists but this node is not in its own
+                    %% membership view: an earlier join's `add_member` failed.
+                    %% Finish the join, or the retry loop reports success forever
+                    %% while `is_member/1` stays false.
+                    join_cluster(System, Name, hd(lists:sort(Members)))
+            end;
+        {error, name_not_registered} ->
+            Seed = hd(lists:sort(Members)),
+            case node() =:= Seed of
+                true ->
+                    case start_cluster(System, Name, [node()]) of
+                        {ok, _, _} -> ok;
+                        {error, _} = Err -> Err
+                    end;
+                false ->
+                    join_cluster(System, Name, Seed)
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Trigger an election for a recovered single-member cluster, which `ra` would
+%% otherwise leave passive (only `start_cluster` triggers the initial one), so it
+%% would sit leaderless after a full node restart with no peer to elect it.
+%%
+%% The decisive fact is this node's *actual recovered* membership, not the
+%% caller's intended `Members`: mid-bootstrap a node may have formed a sole-member
+%% cluster on disk while the caller already knows the full node set. A local
+%% membership query (answered without a leader) tells us the truth. A genuine
+%% multi-member cluster re-elects among its peers and must not be forced.
+%% Idempotent: harmless if the server is already the leader.
+maybe_trigger_sole_member_election(Name, _Members) ->
+    ServerId = {Name, node()},
+    case ra:members({local, ServerId}, ?CMD_TIMEOUT) of
+        {ok, [ServerId], _Leader} ->
+            _ = catch ra:trigger_election(ServerId),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% Set both identically on every node: `init/1` stores them in replicated
+%% state.
+machine(Name) ->
+    Tick = application:get_env(portunus, tick_interval_ms, 1000),
+    SnapInterval = application:get_env(portunus, snapshot_interval, 4096),
+    {module, portunus_machine, #{cluster => Name,
+                                 tick_interval_ms => Tick,
+                                 snapshot_interval => SnapInterval}}.
+
+-doc "Add a node as a member (auto-add is safe).".
+-spec add_member(name(), node()) -> ok_or_error(term()).
+add_member(Name, Node) ->
+    case ra:add_member(leader_or_local(Name), {Name, Node}) of
+        {ok, _, _} -> ok;
+        {timeout, _} = T -> {error, T};
+        {error, _} = Err -> Err
+    end.
+
+-doc "Remove a member. Removal is explicit, never automatic.".
+-spec remove_member(name(), node()) -> ok_or_error(term()).
+remove_member(Name, Node) ->
+    case ra:remove_member(leader_or_local(Name), {Name, Node}) of
+        {ok, _, _} -> ok;
+        {timeout, _} = T -> {error, T};
+        {error, _} = Err -> Err
+    end.
+
+-doc "Stop and wipe a server's data dir. Refuses if still a member.".
+-spec reset_server(system(), server_id()) ->
+    ok_or_error(still_member | no_quorum).
+reset_server(System, {Name, _Node} = ServerId) ->
+    case ra:members({Name, node()}, ?CMD_TIMEOUT) of
+        {ok, Members, _} ->
+            case lists:member(ServerId, Members) of
+                true ->
+                    {error, still_member};
+                false ->
+                    _ = ra:stop_server(System, ServerId),
+                    _ = ra:force_delete_server(System, ServerId),
+                    ok
+            end;
+        _ ->
+            %% Refuse rather than risk wiping a live member: a failed membership
+            %% query (a transient no_quorum) is not proof of non-membership.
+            {error, no_quorum}
+    end.
+
+-doc "Current members and the leader.".
+-spec members(name()) -> {ok, [server_id()], server_id()} | {error, term()}.
+members(Name) ->
+    case ra:members({Name, node()}, ?CMD_TIMEOUT) of
+        {ok, _, _} = Ok -> Ok;
+        {timeout, _} = T -> {error, T};
+        {error, _} = Err -> Err
+    end.
+
+%%----------------------------------------------------------------------
+%% Leases
+%%----------------------------------------------------------------------
+
+-doc "Grant a lease with a TTL in milliseconds. See `grant_lease/3` for options.".
+-spec grant_lease(name(), ttl()) -> {ok, lease_id()} | {error, lease_error()}.
+grant_lease(Name, TtlMs) when is_integer(TtlMs), TtlMs > 0 ->
+    grant_lease(Name, TtlMs, #{}).
+
+-doc """
+Grant a lease with a TTL in milliseconds. With `#{auto_renew => true}` a
+holder-linked renewer keeps it alive for as long as the calling process
+lives; the lease (and any locks held under it) ends when the caller dies
+or revokes. The returned id is used exactly like any other. A
+`proposed_id` makes the grant idempotent under retry; without one the id
+is auto-assigned.
+
+A holder that revokes an auto-renewed lease receives one final
+`{portunus, lease_lost, LeaseId}` when the renewer discovers the
+revocation; ignore it. For a renewer the holder can stop explicitly,
+use `keep_alive/3`, which returns the renewer's pid.
+""".
+-spec grant_lease(name(), ttl(), grant_opts()) ->
+    {ok, lease_id()} | {error, lease_error()}.
+%% `auto_renew` requires the renewer's TTL floor (see `portunus_keepalive`);
+%% failing the guard here rejects the call before a lease is granted.
+grant_lease(Name, TtlMs, #{auto_renew := true} = Opts)
+  when is_integer(TtlMs), TtlMs >= ?MIN_RENEWABLE_TTL_MS ->
+    grant_lease1(Name, TtlMs, Opts);
+grant_lease(Name, TtlMs, Opts)
+  when is_integer(TtlMs), TtlMs > 0, is_map(Opts),
+       not is_map_key(auto_renew, Opts) orelse
+       map_get(auto_renew, Opts) =:= false ->
+    grant_lease1(Name, TtlMs, Opts).
+
+grant_lease1(Name, TtlMs, Opts) ->
+    ProposedId = maps:get(proposed_id, Opts, undefined),
+    case cmd(Name, {grant_lease, ProposedId, TtlMs, self(), self()}) of
+        {ok, LeaseId} = Ok ->
+            case maps:get(auto_renew, Opts, false) of
+                true ->
+                    {ok, _Renewer} = portunus_keepalive:start_link(Name, LeaseId, TtlMs),
+                    Ok;
+                false ->
+                    Ok
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc "Renew one or more leases in a single command (batch renew).".
+-spec renew_leases(name(), [lease_id()]) ->
+    [{lease_id(), ok | {error, lease_expired | no_quorum}}].
+renew_leases(Name, LeaseIds) ->
+    renew_leases(Name, LeaseIds, ?CMD_TIMEOUT).
+
+-doc """
+Renew with an explicit command timeout. A renewer bounds this to a fraction
+of the TTL so several attempts fit within one TTL across a leader change.
+""".
+-spec renew_leases(name(), [lease_id()], timeout()) ->
+    [{lease_id(), ok | {error, lease_expired | no_quorum}}].
+renew_leases(Name, LeaseIds, Timeout) when is_list(LeaseIds) ->
+    case cmd(Name, {renew, LeaseIds}, Timeout) of
+        {error, no_quorum} -> [{L, {error, no_quorum}} || L <- LeaseIds];
+        Results -> Results
+    end.
+
+-doc "Revoke a lease and release every lock held under it.".
+-spec revoke_lease(name(), lease_id()) -> ok_or_error(no_quorum).
+revoke_lease(Name, LeaseId) ->
+    cmd(Name, {revoke_lease, LeaseId}).
+
+-doc """
+Start a renewer that keeps `LeaseId` alive and is linked to the caller, so
+it stops when the caller does. Pass the TTL the lease was granted with; a
+renewer cannot sustain a TTL below 2000 ms (see `portunus_keepalive`).
+`grant_lease/3` with `#{auto_renew => true}` does the same in one step.
+""".
+-spec keep_alive(name(), lease_id(), ttl()) -> {ok, pid()}.
+keep_alive(Name, LeaseId, TtlMs)
+  when is_integer(TtlMs), TtlMs >= ?MIN_RENEWABLE_TTL_MS ->
+    portunus_keepalive:start_link(Name, LeaseId, TtlMs).
+
+%%----------------------------------------------------------------------
+%% Locks
+%%----------------------------------------------------------------------
+
+-doc """
+Acquire `LockKey` under `LeaseId`, trying once. Returns `{ok, Token}`, the
+fencing token, or `{error, {held_by, Owner}}` if the key is held. It never
+queues: use `acquire_or_join_succession_queue/4` to wait for the key.
+""".
+-spec acquire(name(), lock_key(), lease_id(), owner()) ->
+    {ok, token()} | {error, acquire_error()}.
+acquire(Name, LockKey, LeaseId, Owner) ->
+    acquire(Name, LockKey, LeaseId, Owner, undefined).
+
+-doc """
+Like `acquire/4`, attaching `Context` to the grant (returned by `owner/2`).
+Context is set-once and should be a pointer, not a payload: it lives in every
+replica's state, every snapshot and every `owner/2` reply.
+""".
+-spec acquire(name(), lock_key(), lease_id(), owner(), term()) ->
+    {ok, token()} | {error, acquire_error()}.
+acquire(Name, LockKey, LeaseId, Owner, Context) ->
+    cmd(Name, {acquire, LeaseId, LockKey, Owner, Context, nowait}).
+
+-doc """
+Acquire `LockKey`, or join its succession queue if it is held. Returns
+`{ok, Token}` if the key was free, otherwise `{queued, Depth}` (the number of
+waiters on the key, not a place in line), and later sends
+`{portunus, granted, Key, Token, LeaseId}` to the lease holder once it is
+promoted.
+""".
+-spec acquire_or_join_succession_queue(name(), lock_key(), lease_id(), owner()) ->
+    {ok, token()} | {queued, pos_integer()} | {error, acquire_error()}.
+acquire_or_join_succession_queue(Name, LockKey, LeaseId, Owner) ->
+    acquire_or_join_succession_queue(Name, LockKey, LeaseId, Owner, #{}).
+
+-doc """
+Like `acquire_or_join_succession_queue/4`, with `#{affinity => Spec}` to bias
+which contender is promoted first (see `portunus_affinity`; the default is
+FIFO in arrival order) and `#{context => Term}` to attach a context to the
+grant on promotion, as `acquire/5` does for an immediate grant.
+""".
+-spec acquire_or_join_succession_queue(name(), lock_key(), lease_id(), owner(),
+                                       succession_opts()) ->
+    {ok, token()} | {queued, pos_integer()} | {error, acquire_error()}.
+acquire_or_join_succession_queue(Name, LockKey, LeaseId, Owner, Opts) ->
+    Score = succession_score(Name, LockKey, Opts),
+    Context = maps:get(context, Opts, undefined),
+    cmd(Name, {acquire, LeaseId, LockKey, Owner, Context, wait, Score}).
+
+%% The succession score: an affinity spec resolved over the current members,
+%% defaulting to 0 (FIFO). A faulty strategy degrades to FIFO; affinity is a
+%% hint, not a correctness requirement. The raw integer `score` key is an
+%% internal escape hatch, deliberately absent from `succession_opts()`.
+succession_score(_Name, _Key, #{score := Score}) when is_integer(Score) ->
+    Score;
+succession_score(_Name, _Key, #{affinity := default}) ->
+    0;
+succession_score(Name, Key, #{affinity := Spec}) ->
+    %% A local membership view: affinity is a hint, and a leader query here
+    %% would block the caller for the command timeout during an election.
+    Members = case ra:members({local, {Name, node()}}, 1000) of
+                  {ok, ServerIds, _} -> [N || {_, N} <- ServerIds];
+                  _ -> [node()]
+              end,
+    try portunus_affinity:score(Spec, Key, Members)
+    catch Class:Reason ->
+        logger:warning("portunus affinity ~p failed (~p:~p) for key ~p; "
+                       "using FIFO succession", [Spec, Class, Reason, Key]),
+        0
+    end;
+succession_score(_Name, _Key, _Opts) ->
+    0.
+
+-doc "Release a held lock. Token-fenced: a stale token cannot release a re-granted lock.".
+-spec release(name(), lock_key(), token()) -> ok_or_error(release_error()).
+release(Name, LockKey, Token) ->
+    cmd(Name, {release, LockKey, Token}).
+
+-doc "Query the owner of a lock (linearizable).".
+-spec owner(name(), lock_key()) ->
+    {ok, owner_info()} | {error, not_held | no_quorum}.
+owner(Name, LockKey) ->
+    query(Name, {portunus_machine, query_owner, [LockKey]}).
+
+%%----------------------------------------------------------------------
+%% Watch
+%%----------------------------------------------------------------------
+
+-doc """
+Watch a key; the caller receives `{portunus, watch, Ref, Event}` messages,
+where `Event` is `{acquired, Owner}` or `released`. One watch per process per
+key: re-watching returns a new ref and supersedes the old. Pass `Ref` to
+`unwatch/2`.
+""".
+-spec watch(name(), lock_key()) -> {ok, watch_ref()} | {error, no_quorum}.
+watch(Name, LockKey) ->
+    cmd(Name, {watch, LockKey, self()}).
+
+-doc "Stop the watch registered under `Ref`.".
+-spec unwatch(name(), watch_ref()) -> ok_or_error(no_quorum).
+unwatch(Name, Ref) ->
+    cmd(Name, {unwatch, Ref}).
+
+%%----------------------------------------------------------------------
+%% Health and introspection
+%%----------------------------------------------------------------------
+
+-doc "Whether the cluster currently has an online majority (a quorum-confirming read).".
+-spec has_quorum(name()) -> boolean().
+has_quorum(Name) ->
+    case ra:consistent_query(leader_or_local(Name),
+                             {portunus_machine, query_status, []},
+                             ?CMD_TIMEOUT) of
+        {ok, M, _} when is_map(M) -> true;
+        _ -> false
+    end.
+
+-doc """
+Whether this node is a member of cluster `Name`. Answered from the local
+replica without contacting the leader, so it holds during an election or a
+quorum loss, and is false when no local replica is running. Useful for a host
+that bootstraps the cluster and needs to know when this node has joined.
+
+A local view alone cannot decide this: Ra always includes a server in its
+own view, joined or not. A genuine member also holds at least the log entry
+that added it, so an empty log means the join never committed.
+""".
+-spec is_member(name()) -> boolean().
+is_member(Name) ->
+    ServerId = {Name, node()},
+    case ra:members({local, ServerId}, ?CMD_TIMEOUT) of
+        {ok, Members, _Leader} ->
+            lists:member(ServerId, Members) andalso has_log_entries(ServerId);
+        _ ->
+            false
+    end.
+
+has_log_entries(ServerId) ->
+    KM = try ra:key_metrics(ServerId) catch _:_ -> #{} end,
+    maps:get(last_index, KM, 0) > 0.
+
+-doc "A snapshot of cluster health and the machine-derived counts.".
+-spec status(name()) -> status().
+status(Name) ->
+    %% A successful consistent_query is itself the quorum signal, so derive
+    %% quorum from it rather than issuing a second identical query.
+    {Base, Quorum} = case query(Name, {portunus_machine, query_status, []}) of
+                         M when is_map(M) -> {M, true};
+                         _ -> {#{}, false}
+                     end,
+    {Members, Leader} = case members(Name) of
+                            {ok, Ms, L} -> {Ms, L};
+                            _ -> {[], undefined}
+                        end,
+    Base#{leader => Leader,
+          members => Members,
+          quorum => Quorum}.
+
+%%----------------------------------------------------------------------
+%% Conveniences
+%%----------------------------------------------------------------------
+
+-doc """
+One-shot exclusive lock with auto-renewal: grant a lease, acquire the
+key, and start a holder-linked renewer. Returns a handle for `unlock/1`.
+""".
+-spec lock(name(), lock_key(), ttl()) ->
+    {ok, handle()} | {error, acquire_error() | lease_error()}.
+lock(Name, LockKey, TtlMs)
+  when is_integer(TtlMs), TtlMs >= ?MIN_RENEWABLE_TTL_MS ->
+    case grant_lease(Name, TtlMs) of
+        {ok, LeaseId} ->
+            {ok, Renewer} = portunus_keepalive:start_link(Name, LeaseId, TtlMs),
+            case acquire(Name, LockKey, LeaseId, self()) of
+                {ok, Token} ->
+                    {ok, #{name => Name, key => LockKey, lease => LeaseId,
+                           token => Token, renewer => Renewer}};
+                Err ->
+                    %% Acquire failed (e.g. held_by): do not leak the lease
+                    %% or the renewer.
+                    _ = portunus_keepalive:stop(Renewer),
+                    _ = revoke_lease(Name, LeaseId),
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc "Release a lock taken with `lock/3`: stop the renewer and revoke the lease.".
+-spec unlock(handle()) -> ok.
+unlock(#{name := Name, lease := LeaseId, renewer := Renewer}) ->
+    _ = portunus_keepalive:stop(Renewer),
+    _ = revoke_lease(Name, LeaseId),
+    ok.
+
+-doc "Run `Fun` while holding `LockKey`, releasing on return or exception.".
+-spec with_lock(name(), lock_key(), ttl(), fun(() -> Result)) ->
+    Result | {error, acquire_error() | lease_error()}.
+with_lock(Name, LockKey, TtlMs, Fun)
+  when is_integer(TtlMs), TtlMs >= ?MIN_RENEWABLE_TTL_MS, is_function(Fun, 0) ->
+    case lock(Name, LockKey, TtlMs) of
+        {ok, Handle} ->
+            try Fun()
+            after
+                unlock(Handle)
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%%----------------------------------------------------------------------
+%% Internal
+%%----------------------------------------------------------------------
+
+leader_or_local(Name) ->
+    case ra_leaderboard:lookup_leader(Name) of
+        undefined -> {Name, node()};
+        Leader -> Leader
+    end.
+
+%% Ra registers the local server under the cluster `Name`. If another process
+%% already holds that registered name, Ra cannot start the server and the
+%% failure surfaces as `cluster_not_formed` with nothing pointing at the cause.
+%% Catch the local collision early. A name held by this cluster's own Ra server,
+%% an idempotent re-call, is not a collision: `ra_directory` knows that name.
+-spec ensure_name_unregistered(system(), name()) ->
+    ok | {error, {name_registered, pid()}}.
+ensure_name_unregistered(System, Name) ->
+    case whereis(Name) of
+        undefined ->
+            ok;
+        Pid ->
+            case is_ra_server(System, Name) of
+                true -> ok;
+                false -> {error, {name_registered, Pid}}
+            end
+    end.
+
+%% True only if `Name` is registered as a Ra server in `System`, identified by a
+%% uid in `ra_directory`. portunus only registers Ra servers under a cluster
+%% name, so a hit is this cluster's own server and a miss is a foreign process. A
+%% lookup that raises (the system is not started) counts as a miss, so a foreign
+%% registration still gets the clear error.
+-spec is_ra_server(system(), name()) -> boolean().
+is_ra_server(System, Name) ->
+    try ra_directory:uid_of(System, Name) of
+        UId when is_binary(UId) -> true;
+        _ -> false
+    catch
+        _:_ -> false
+    end.
+
+%% Ra's `process_command/3` and `consistent_query/3` specs declare only
+%% `{ok, _, _}`, `{timeout, _}` and `{error, _}`, but a server mid-election with
+%% no leader can answer a bare `ok`, so the catch-all clauses in `cmd/3` and
+%% `query/2` are reachable in practice. Dialyzer trusts the understated upstream
+%% spec and reads them as dead, a false positive silenced here.
+-dialyzer({no_match, [{cmd, 3}, {query, 2}]}).
+
+cmd(Name, Command) ->
+    cmd(Name, Command, ?CMD_TIMEOUT).
+
+cmd(Name, Command, Timeout) ->
+    case ra:process_command(leader_or_local(Name), Command, Timeout) of
+        {ok, Reply, _Leader} -> Reply;
+        {timeout, _} -> no_online_quorum(Name, timeout);
+        {error, Reason} -> no_online_quorum(Name, Reason);
+        %% `ra:process_command/3` can answer with a bare `ok` for a command it
+        %% cannot turn into a committed reply, e.g. when the target server is a
+        %% follower mid-election with no leader to forward to. There is no
+        %% confirmation the command applied, so treat it (and any other
+        %% unexpected term) as a transient quorum failure the caller retries,
+        %% rather than crashing on a non-exhaustive `case`.
+        Other -> no_online_quorum(Name, {unexpected_reply, Other})
+    end.
+
+%% A command could not be committed. The reason (timeout, the local server
+%% down, a lost majority) is logged for diagnosis while callers still see a
+%% single stable `no_quorum`, and the rejection is counted.
+no_online_quorum(Name, Reason) ->
+    ok = portunus_counters:incr(Name, failures_due_to_lack_of_online_quorum_total),
+    logger:debug("portunus command on ~p rejected: ~p", [Name, Reason]),
+    {error, no_quorum}.
+
+query(Name, QueryMFA) ->
+    case ra:consistent_query(leader_or_local(Name), QueryMFA, ?CMD_TIMEOUT) of
+        {ok, Result, _Leader} -> Result;
+        {timeout, _} -> no_online_quorum(Name, timeout);
+        {error, Reason} -> no_online_quorum(Name, Reason);
+        %% As in `cmd/3`: a bare `ok` or other unexpected term from a server in
+        %% a transient state is a quorum failure, not a result.
+        Other -> no_online_quorum(Name, {unexpected_reply, Other})
+    end.
+
+resolve_membership(Nodes) when is_list(Nodes) ->
+    Nodes;
+resolve_membership({M, F}) ->
+    M:F();
+resolve_membership(local) ->
+    [node()].
+
+default_data_dir(System) ->
+    Base = case application:get_env(ra, data_dir) of
+               {ok, D} -> D;
+               undefined ->
+                   Tmp = filename:join(["/tmp", "portunus"]),
+                   logger:warning(
+                     "portunus: no data_dir configured and ra's data_dir is "
+                     "unset, falling back to ~ts. This is volatile storage: a "
+                     "reboot can wipe the Raft log, and fencing tokens then "
+                     "restart low. Configure a persistent data_dir for "
+                     "anything but throwaway use.", [Tmp]),
+                   Tmp
+           end,
+    filename:join(Base, atom_to_list(System)).
