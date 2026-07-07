@@ -1,6 +1,6 @@
 # Portunus
 
-A small, generic lock server for the Erlang ecosystem, built on
+`portunus` is a small, generic lock server for the Erlang ecosystem, built on
 [Ra](https://github.com/rabbitmq/ra), RabbitMQ's Raft implementation.
 It provides cluster-wide mutual exclusion, TTL leases with renewal,
 leader election, and a succession queue with pluggable placement
@@ -18,14 +18,21 @@ possible but likely.
 
 ## Why
 
-Distributed coordination in Erlang systems is too often hand-rolled on
-`global` locks (not partition-safe, no fencing) or bespoke supervisors.
-Portunus replaces them with a single partition-safe primitive, a lock
-service like Google's Chubby. Its first job is replacing
-`mirrored_supervisor`, but it is useful anywhere exactly one instance of
-something must run in a cluster at any given time.
+Because the standard library's `global` module has its limits (no
+clear partition handling semantics, no fencing token support,
+major changes and rapid iteration are out of the question due to its maturity),
+and hand-rolling a distributed locking library (compared to to ZooKeeper, `etcd`,
+Consul in terms of core features) is hard and error-prone.
+
+At the same time, the field of Raft-based distributed locking
+services is mature and well understood. And Team RabbitMQ
+happens to have a mature and solid Raft implementation.
+
 
 ## Core Ideas
+
+`portunus` is an embedded distributed lock server with the following
+key concepts and design ideas:
 
  * Safety and liveness are separated. At most one owner per key, and
    monotonically increasing fencing tokens, are guaranteed by Raft,
@@ -45,6 +52,16 @@ something must run in a cluster at any given time.
    `preferred`, `hash`, `metric`, `random`, or a custom
    `portunus_affinity` module) biases which node wins. Affinity is a
    hint, never a correctness requirement
+
+## Supported Erlang/OTP Versions
+
+Portunus requires Erlang/OTP 27 and should work equally well on
+Erlang 28 and 29, including mixed-version clusters during upgrades.
+
+## Supported `ra` Versions
+
+Portunus targets `ra` `3.1.8` or later versions.
+
 
 ## Getting Started
 
