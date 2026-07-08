@@ -30,6 +30,7 @@ the decision is always re-derived from replicated state.
 
 %% Exported for queries run via ra:consistent_query/local_query.
 -export([query_owner/2,
+         query_contenders/2,
          query_status/1]).
 
 -define(DEFAULT_TICK_MS, 1000).
@@ -59,6 +60,7 @@ the decision is always re-derived from replicated state.
         {acquire, lease_id(), lock_key(), owner(), term(), wait | nowait,
          integer()} |
         {release, lock_key(), token()} |
+        {transfer, lock_key(), token(), owner()} |
         {watch, lock_key(), pid()} |
         {unwatch, watch_ref()} |
         {timeout, expire} |
@@ -232,6 +234,25 @@ do_apply(Meta, {release, LockKey, Token}, State0) ->
             end;
         error ->
             {State0, {error, not_held}}
+    end;
+%% Token-fenced like release: only the current holder transfers, and only to a
+%% named contender. A free key or a stale token returns not_owner, a target
+%% equal to the holder returns ok, and a target with no live contender is
+%% refused.
+do_apply(Meta, {transfer, LockKey, Token, TargetOwner}, State0) ->
+    case maps:find(LockKey, State0#?MODULE.locks) of
+        {ok, LeaseId} ->
+            Lease = maps:get(LeaseId, State0#?MODULE.leases),
+            case maps:get(LockKey, Lease#lease.keys) of
+                #held_lock{token = Token, owner = TargetOwner} ->
+                    {State0, ok};
+                #held_lock{token = Token} ->
+                    do_transfer(Meta, LockKey, LeaseId, TargetOwner, State0);
+                #held_lock{} ->
+                    {State0, {error, not_owner}}
+            end;
+        error ->
+            {State0, {error, not_owner}}
     end;
 %% A non-pid here would crash every successive leader through the monitor
 %% effect and `state_enter/2`'s re-derivation, hence the guard.
@@ -415,6 +436,15 @@ query_owner(LockKey, State) ->
             {error, not_held}
     end.
 
+%% Live contenders (their owner terms) for a key, read by the transfer
+%% pre-check (`portunus_election:transfer_to/2`). A waiter whose lease is gone
+%% is not a viable target, so it is left out.
+-spec query_contenders(lock_key(), state()) -> [owner()].
+query_contenders(LockKey, State) ->
+    Ws = maps:get(LockKey, State#?MODULE.leader_succession_queue, []),
+    [W#waiter.owner || W <- Ws,
+                       maps:is_key(W#waiter.lease_id, State#?MODULE.leases)].
+
 -spec query_status(state()) -> map().
 query_status(State) ->
     overview(State).
@@ -567,6 +597,43 @@ promote_waiter(Meta, LockKey, Revoking, State0, Effs) ->
             %% Released before acquired, so a watcher's last event on a handoff
             %% reflects the new owner, not a key that looks free.
             {State2, [incr(acquires_total, State2) | GrantEffs] ++ Effs ++ Effs1}
+    end.
+
+%% Targeted transfer: promote the highest-ranked live waiter whose owner is
+%% `TargetOwner`, removing the current holder in the same transition. The key
+%% is never free and never doubly held, and the new token comes from this
+%% command's index, so per-key monotonicity holds exactly as for a lapse.
+do_transfer(Meta, LockKey, OldLeaseId, TargetOwner, State0) ->
+    Ws0 = maps:get(LockKey, State0#?MODULE.leader_succession_queue, []),
+    Matching = [W || W <- Ws0,
+                     W#waiter.owner =:= TargetOwner,
+                     maps:is_key(W#waiter.lease_id, State0#?MODULE.leases)],
+    case Matching of
+        [] ->
+            {State0, {error, {no_contender, TargetOwner}},
+             [incr(transfer_no_contender_total, State0)]};
+        _ ->
+            #waiter{lease_id = NewLeaseId, seq = Seq} = Best = best_waiter(Matching),
+            %% Drop the key from the current holder, keep every other waiter.
+            OldLease = maps:get(OldLeaseId, State0#?MODULE.leases),
+            OldLease1 = OldLease#lease{keys = maps:remove(LockKey,
+                                                          OldLease#lease.keys)},
+            Rest = [W || W <- Ws0, W#waiter.seq =/= Seq],
+            State1 = set_waiters(LockKey, Rest,
+                                 set_lease(OldLeaseId, OldLease1, State0)),
+            %% Install the target as the new holder with a fresh token.
+            NewLease = maps:get(NewLeaseId, State1#?MODULE.leases),
+            Token = index(Meta),
+            Held = #held_lock{token = Token, owner = Best#waiter.owner,
+                              context = Best#waiter.context, since = now_ms(Meta)},
+            NewLease1 = NewLease#lease{keys = maps:put(LockKey, Held,
+                                                       NewLease#lease.keys)},
+            State2 = bump_token(Token,
+                                set_lock(LockKey, NewLeaseId,
+                                         set_lease(NewLeaseId, NewLease1, State1))),
+            Effs = notify_watchers(LockKey, {acquired, Best#waiter.owner}, State2),
+            GrantEffs = grant_msg(NewLease#lease.pid, LockKey, Token, NewLeaseId),
+            {State2, ok, [incr(transfers_total, State2) | GrantEffs] ++ Effs}
     end.
 
 best_waiter([W | Ws]) ->

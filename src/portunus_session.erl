@@ -102,7 +102,7 @@ handle_call(establish, _From, #state{name = Name, opts = Opts,
     end;
 handle_call({claim, Key}, _From, State) ->
     case portunus:acquire(State#state.name, Key, State#state.lease_id,
-                          {session, node()}) of
+                          node()) of
         {ok, Token} ->
             {reply, {ok, Token},
              State#state{keys = maps:put(Key, Token, State#state.keys)}};

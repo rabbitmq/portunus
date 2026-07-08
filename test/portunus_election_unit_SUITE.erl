@@ -17,7 +17,10 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2]).
 -export([crash_promotes_standby/1,
-         lease_loss_steps_down_and_recontends/1]).
+         lease_loss_steps_down_and_recontends/1,
+         transfer_to_self_is_noop/1,
+         transfer_to_unready_target_refuses_without_stepdown/1,
+         transfer_to_non_owner_is_not_owner/1]).
 
 -define(SYS, portunus).
 -define(NAME, portunus_election_test).
@@ -25,7 +28,10 @@
 
 all() ->
     [crash_promotes_standby,
-     lease_loss_steps_down_and_recontends].
+     lease_loss_steps_down_and_recontends,
+     transfer_to_self_is_noop,
+     transfer_to_unready_target_refuses_without_stepdown,
+     transfer_to_non_owner_is_not_owner].
 
 init_per_suite(Config) ->
     application:set_env(portunus, tick_interval_ms, 200),
@@ -76,6 +82,40 @@ lease_loss_steps_down_and_recontends(_Config) ->
         ct:fail(no_recontend)
     end,
     true = exit(E, kill).
+
+%% Transferring to this node returns `ok`: no step-down, still the owner.
+transfer_to_self_is_noop(_Config) ->
+    Key = {election, xfer_self},
+    {ok, E} = start(Key),
+    receive {elected, Key, _T, E} -> ok after 30000 -> ct:fail(no_leader) end,
+    ok = portunus_election:transfer_to(E, node()),
+    receive {stepped_down, Key, E} -> ct:fail(unexpected_stepdown) after 500 -> ok end,
+    true = portunus_election:is_leader(E),
+    true = exit(E, kill).
+
+%% A target that is not a ready contender is refused by the pre-check before
+%% any local work stops: no step-down, the healthy owner stays.
+transfer_to_unready_target_refuses_without_stepdown(_Config) ->
+    Key = {election, xfer_unready},
+    {ok, E} = start(Key),
+    receive {elected, Key, _T, E} -> ok after 30000 -> ct:fail(no_leader) end,
+    Ghost = 'ghost@nohost',
+    {error, {no_contender, Ghost}} = portunus_election:transfer_to(E, Ghost),
+    receive {stepped_down, Key, E} -> ct:fail(unexpected_stepdown) after 500 -> ok end,
+    true = portunus_election:is_leader(E),
+    true = exit(E, kill).
+
+%% Only the owner can transfer: a standby returns not_owner.
+transfer_to_non_owner_is_not_owner(_Config) ->
+    Key = {election, xfer_follower},
+    {ok, E1} = start(Key),
+    receive {elected, Key, _T, E1} -> ok after 30000 -> ct:fail(no_leader) end,
+    {ok, E2} = start(Key),
+    timer:sleep(1000),
+    false = portunus_election:is_leader(E2),
+    {error, not_owner} = portunus_election:transfer_to(E2, node()),
+    true = exit(E1, kill),
+    true = exit(E2, kill).
 
 %%----------------------------------------------------------------------
 %% Helpers
