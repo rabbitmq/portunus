@@ -10,13 +10,17 @@
 %% mixing it with eunit/ct headers redefines macros such as LET.
 -include_lib("proper/include/proper.hrl").
 
--export([all/0, priority_succession/1]).
+-export([all/0, priority_succession/1, transfer_reaches_named_target/1]).
 
 all() ->
-    [priority_succession].
+    [priority_succession, transfer_reaches_named_target].
 
 priority_succession(_Config) ->
     true = portunus_test_helpers:quickcheck(fun prop_priority_succession/0, 500).
+
+transfer_reaches_named_target(_Config) ->
+    true = portunus_test_helpers:quickcheck(
+             fun prop_transfer_reaches_named_target/0, 500).
 
 %% For a key with a held owner and a queue of waiters carrying random
 %% scores, releasing the holder promotes exactly the live waiter with the
@@ -36,6 +40,34 @@ prop_priority_succession() ->
                         end,
                 Owner =:= expected_winner(Waiters)
             end).
+
+%% For the same held-owner-and-queue setup, a transfer to a named contender's
+%% owner promotes exactly that contender regardless of its score, or, if the
+%% named owner is not a live waiter, is refused and the holder keeps the key.
+%% This is the targeting guarantee, sampled against the real `apply/3`.
+prop_transfer_reaches_named_target() ->
+    ?FORALL({Waiters, TargetIx}, {non_empty(list(waiter())), choose(0, 5)},
+            begin
+                {THolder, S} = enqueue_scored(Waiters),
+                Target = {w, TargetIx},
+                {Reply, SR, _} = step({transfer, k, THolder, Target}, 1000000, S),
+                Owner = case portunus_machine:query_owner(k, SR) of
+                            {ok, #{owner := W}} -> W;
+                            {error, not_held} -> none
+                        end,
+                case is_live_waiter(TargetIx, Waiters) of
+                    true ->
+                        Reply =:= ok andalso Owner =:= Target;
+                    false ->
+                        Reply =:= {error, {no_contender, Target}}
+                            andalso Owner =:= o0
+                end
+            end).
+
+%% Waiter index `I` was enqueued (in range) and its lease still lives.
+is_live_waiter(I, Waiters) ->
+    I < length(Waiters)
+        andalso element(2, lists:nth(I + 1, Waiters)) =:= live.
 
 %% A waiter is a score and whether its lease survives to the release.
 waiter() ->

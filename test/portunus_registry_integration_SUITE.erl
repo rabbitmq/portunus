@@ -15,7 +15,8 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
--export([registry_child_moves_to_survivor/1]).
+-export([registry_child_moves_to_survivor/1,
+         registry_transfer_hands_child_to_named_peer/1]).
 %% Run on the peer nodes.
 -export([registry_holder/3, member_keys/0, start_worker/0]).
 
@@ -24,7 +25,8 @@
 -define(TTL, 3000).
 
 all() ->
-    [registry_child_moves_to_survivor].
+    [registry_child_moves_to_survivor,
+     registry_transfer_hands_child_to_named_peer].
 
 init_per_suite(Config) ->
     case portunus_ct_cluster:ensure_distribution() of
@@ -56,6 +58,30 @@ registry_child_moves_to_survivor(Config) ->
     stop_node(Owner, Config),
     ok = portunus_test_helpers:await_condition(
            fun() -> length(owners(Survivors, Key)) =:= 1 end, ?TTL + 30000).
+
+%% The current owner hands the child to a named peer with a targeted transfer:
+%% the child moves there and stops on the former owner, and a transfer from the
+%% former owner (now a standby) is refused.
+registry_transfer_hands_child_to_named_peer(Config) ->
+    #{nodes := Nodes} = ?config(cluster, Config),
+    Key = {svc, transfer},
+    [start_registry(N, Key) || N <- Nodes],
+    ok = portunus_test_helpers:await_condition(
+           fun() -> length(owners(Nodes, Key)) =:= 1 end, 30000),
+    [Owner] = owners(Nodes, Key),
+    Target = hd(Nodes -- [Owner]),
+    %% Retry tolerates a lagging local replica not yet showing the target as a
+    %% contender; the transfer itself moves ownership on the first `ok`.
+    ok = portunus_test_helpers:await_condition(
+           fun() ->
+                   rpc:call(Owner, portunus_registry, transfer,
+                            [?REG, Key, Target]) =:= ok
+           end, 30000),
+    ok = portunus_test_helpers:await_condition(
+           fun() -> owners(Nodes, Key) =:= [Target] end, 30000),
+    %% The former owner is a standby now, so a transfer from it is refused.
+    {error, not_owner} =
+        rpc:call(Owner, portunus_registry, transfer, [?REG, Key, Owner]).
 
 %%----------------------------------------------------------------------
 %% Registry holders and child on the peer nodes

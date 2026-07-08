@@ -52,7 +52,7 @@ pinned_affinity_wins_succession(Config) ->
     Pin = {pinned, N2},
     %% N1 starts first and, unopposed, takes the lock.
     H1 = start_election(N1, Key, Pin),
-    await_owner(N1, Key, {election, N1}),
+    await_owner(N1, Key, N1),
     %% N3 (score 0) queues first, then N2 (score 1). Waiting for each to
     %% enqueue before starting the next fixes the arrival order, so N2
     %% winning below can only be the score, not FIFO.
@@ -63,10 +63,10 @@ pinned_affinity_wins_succession(Config) ->
     %% Dropping N1 promotes N2 ahead of the earlier-queued N3, because its
     %% pinned score outranks FIFO order.
     stop_election(H1),
-    await_owner(N1, Key, {election, N2}),
+    await_owner(N1, Key, N2),
     %% When the pinned node leaves too, succession falls to N3.
     stop_election(H2),
-    await_owner(N1, Key, {election, N3}).
+    await_owner(N1, Key, N3).
 
 hash_affinity_selects_rendezvous_winner(Config) ->
     #{nodes := [N1, N2, N3]} = ?config(cluster, Config),
@@ -74,7 +74,7 @@ hash_affinity_selects_rendezvous_winner(Config) ->
     Hash = {hash, []},
     %% N1 holds first; N2 and N3 queue behind it.
     H1 = start_election(N1, Key, Hash),
-    await_owner(N1, Key, {election, N1}),
+    await_owner(N1, Key, N1),
     _H3 = start_election(N3, Key, Hash),
     await_queued(N1, Key, 1),
     H2 = start_election(N2, Key, Hash),
@@ -82,7 +82,7 @@ hash_affinity_selects_rendezvous_winner(Config) ->
     %% Dropping N1, rendezvous hashing promotes the higher-weight node of
     %% the two waiters, regardless of arrival order.
     stop_election(H1),
-    await_owner(N1, Key, {election, rendezvous_winner(Key, [N2, N3])}),
+    await_owner(N1, Key, rendezvous_winner(Key, [N2, N3])),
     stop_election(H2).
 
 metric_affinity_highest_bid_wins(Config) ->
@@ -92,14 +92,14 @@ metric_affinity_highest_bid_wins(Config) ->
     %% one. The fun runs on each node, so `node/0` names the bidder.
     Bid = {metric, fun () -> bid(node(), N2) end},
     H1 = start_election(N1, Key, Bid),
-    await_owner(N1, Key, {election, N1}),
+    await_owner(N1, Key, N1),
     _H3 = start_election(N3, Key, Bid),
     await_queued(N1, Key, 1),
     H2 = start_election(N2, Key, Bid),
     await_queued(N1, Key, 2),
     %% Dropping N1, the highest bidder wins succession over earlier-queued N3.
     stop_election(H1),
-    await_owner(N1, Key, {election, N2}),
+    await_owner(N1, Key, N2),
     stop_election(H2).
 
 %% The rendezvous (highest-random-weight) winner: each node bids

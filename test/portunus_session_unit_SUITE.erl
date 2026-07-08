@@ -48,7 +48,8 @@ lease_loss_stops_session_and_frees_keys(_Config) ->
     {ok, Session} = portunus_session:open(?NAME, #{proposed_id => Id, ttl_ms => ?TTL}),
     Key = {res, session_key},
     {ok, _Token} = portunus_session:claim(Session, Key),
-    {ok, #{owner := {session, _}}} = portunus:owner(?NAME, Key),
+    {ok, #{owner := Owner}} = portunus:owner(?NAME, Key),
+    Owner = node(),
     %% Revoking the lease frees the key at once; the renewer then reports
     %% `expired` and the session stops.
     ok = portunus:revoke_lease(?NAME, Id),

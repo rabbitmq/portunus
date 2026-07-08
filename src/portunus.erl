@@ -38,6 +38,8 @@ target any member's replica (`reset_server/2`).
          acquire_or_join_succession_queue/4,
          acquire_or_join_succession_queue/5,
          release/3,
+         transfer/4,
+         contenders/2,
          owner/2]).
 
 %% Watch.
@@ -102,6 +104,7 @@ target any member's replica (`reset_server/2`).
 -type lease_error()   :: id_in_use | no_quorum.
 -type acquire_error() :: {held_by, owner()} | lease_expired | no_quorum.
 -type release_error() :: not_owner | not_held | no_quorum.
+-type transfer_error() :: not_owner | {no_contender, owner()} | no_quorum.
 
 %% The result shape of every command that carries no value.
 -type ok_or_error(E) :: ok | {error, E}.
@@ -117,7 +120,8 @@ target any member's replica (`reset_server/2`).
 -export_type([name/0, system/0, lock_key/0, lease_id/0, token/0, owner/0,
               ttl/0, server_id/0, owner_info/0, succession_opts/0, watch_ref/0,
               grant_opts/0, env/0, status/0, lease_error/0, acquire_error/0,
-              release_error/0, ok_or_error/1, option/1, handle/0]).
+              release_error/0, transfer_error/0, ok_or_error/1, option/1,
+              handle/0]).
 
 %%
 %% Cluster lifecycle
@@ -590,6 +594,39 @@ succession_score(_Name, _Key, _Opts) ->
 -spec release(name(), lock_key(), token()) -> ok_or_error(release_error()).
 release(Name, LockKey, Token) ->
     cmd(Name, {release, LockKey, Token}).
+
+-doc """
+Hand a held lock to a chosen contender in one machine transition, keeping the
+key held by exactly one owner throughout. `TargetOwner` names the contender by
+its `owner` term; for the node-based batteries that owner is the node, so
+`portunus_election:transfer_to/2` and `portunus_registry:transfer/3` take a
+`node()`.
+
+Token-fenced like `release/3`: only the current holder can transfer,
+and a stale token or a free key returns `{error, not_owner}`. A `TargetOwner`
+equal to the holder's own owner returns `ok`. If no live contender carries
+`TargetOwner` the holder keeps the key and the reply is
+`{error, {no_contender, TargetOwner}}`, never a release to some other node.
+""".
+-spec transfer(name(), lock_key(), token(), owner()) ->
+    ok_or_error(transfer_error()).
+transfer(Name, LockKey, Token, TargetOwner) ->
+    cmd(Name, {transfer, LockKey, Token, TargetOwner}).
+
+-doc """
+The live contenders queued for `LockKey`, as their `owner` terms, read from the
+local replica. Non-blocking and approximate under replica lag, which suits the
+advisory transfer pre-check. Returns `{error, no_quorum}` if the local replica
+cannot answer.
+""".
+-spec contenders(name(), lock_key()) -> {ok, [owner()]} | {error, no_quorum}.
+contenders(Name, LockKey) ->
+    case ra:local_query({Name, node()},
+                        {portunus_machine, query_contenders, [LockKey]},
+                        ?CMD_TIMEOUT) of
+        {ok, {_IdxTerm, Owners}, _Leader} -> {ok, Owners};
+        _ -> {error, no_quorum}
+    end.
 
 -doc "Query the owner of a lock (linearizable).".
 -spec owner(name(), lock_key()) ->

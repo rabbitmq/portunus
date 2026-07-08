@@ -198,7 +198,8 @@ session(_Config) ->
     {ok, _T2} = portunus_session:claim(S, {vhost, b}),
     ?assertEqual(lists:sort([{vhost, a}, {vhost, b}]),
                  lists:sort(portunus_session:keys(S))),
-    {ok, #{owner := {session, _}}} = portunus:owner(?NAME, {vhost, a}),
+    {ok, #{owner := Owner}} = portunus:owner(?NAME, {vhost, a}),
+    Owner = node(),
     ok = portunus_session:release(S, {vhost, a}),
     {error, not_held} = portunus:owner(?NAME, {vhost, a}),
     %% Closing the session drops the remaining keys.

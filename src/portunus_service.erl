@@ -36,7 +36,7 @@ default is FIFO in arrival (registration) order.
 %% elections to the user's `start/3` and `stop/2`.
 -behaviour(portunus_election).
 
--export([start_link/3, start_link/4, stop/1]).
+-export([start_link/3, start_link/4, transfer/3, stop/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 %% portunus_election callbacks
 -export([elected/1, stepped_down/1]).
@@ -70,6 +70,17 @@ start_link(Name, Mod, Args) ->
 start_link(Name, Mod, Args, Opts) when ?IS_RENEWABLE_TTL_OPT(Opts) ->
     gen_server:start_link(?MODULE, {Name, Mod, Args, Opts}, []).
 
+-doc """
+If this node currently owns `Key`, hand ownership to `TargetNode`; if not,
+return `{error, not_owner}`. Only the owner can transfer. If
+`TargetNode` is not a ready contender the owner keeps running and the reply is
+`{error, {no_contender, TargetNode}}`.
+""".
+-spec transfer(pid(), term(), node()) ->
+    portunus:ok_or_error({no_contender, node()} | not_owner | no_quorum).
+transfer(Server, Key, TargetNode) ->
+    gen_server:call(Server, {transfer, Key, TargetNode}, infinity).
+
 -spec stop(pid()) -> ok.
 stop(Pid) ->
     %% An already-stopped service is this call's goal state, not an error.
@@ -92,6 +103,17 @@ init({Name, Mod, Args, Opts}) ->
 
 handle_call(elections, _From, State) ->
     {reply, State#state.elections, State};
+handle_call({transfer, Key, TargetNode}, From,
+            #state{elections = Elections} = State) ->
+    case maps:find(Key, Elections) of
+        {ok, Pid} when is_pid(Pid) ->
+            %% Offloaded so the service stays responsive while one election
+            %% runs its `stepped_down` and the fenced command.
+            _ = spawn(fun() -> gen_server:reply(From, transfer_to(Pid, TargetNode)) end),
+            {noreply, State};
+        _ ->
+            {reply, {error, not_owner}, State}
+    end;
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -141,3 +163,10 @@ start_election(Key, #state{name = Name, group = Group, ttl_ms = TtlMs,
                            mod = Mod, args = Args, affinity = Affinity}) ->
     portunus_election:start_link(Name, {Group, Key}, ?MODULE, {Mod, Key, Args},
                                  #{ttl_ms => TtlMs, affinity => Affinity}).
+
+%% A wedged or timed-out election surfaces as a transient `no_quorum` the
+%% caller retries, rather than crashing the spawned reply process unreplied.
+transfer_to(Pid, TargetNode) ->
+    try portunus_election:transfer_to(Pid, TargetNode)
+    catch exit:_ -> {error, no_quorum}
+    end.

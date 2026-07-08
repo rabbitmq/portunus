@@ -29,8 +29,8 @@ on external resources.
 
 -include("portunus.hrl").
 
--export([start_link/4, start_link/5, is_leader/1, is_leader/2, stop/1,
-         stop_all/1, stop_all/2]).
+-export([start_link/4, start_link/5, is_leader/1, is_leader/2, transfer_to/2,
+         stop/1, stop_all/1, stop_all/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 %% Passed to `elected/1`. `token` is the fencing token for
@@ -87,6 +87,22 @@ caller that must not block treats a timeout as `false`.
 is_leader(Pid, Timeout) ->
     gen_server:call(Pid, is_leader, Timeout).
 
+-doc """
+Ask this node's election, if it is the current owner of its key, to hand
+ownership to `TargetNode`. It pre-checks that `TargetNode` is a ready
+contender, stops the local work, issues the token-fenced transfer, and on
+success re-contends as a standby; if the target was not ready it restores the
+local work and stays owner. Returns `{error, not_owner}` when this node is not
+the owner, and `{error, {no_contender, TargetNode}}` when the target is not a
+ready contender.
+""".
+-spec transfer_to(pid(), node()) ->
+    portunus:ok_or_error({no_contender, node()} | not_owner | no_quorum).
+transfer_to(Pid, TargetNode) ->
+    %% Bounds a `stepped_down`, a fenced command, and `elected`; a wedged
+    %% election surfaces as a timeout the caller retries, not an endless block.
+    gen_server:call(Pid, {transfer_to, TargetNode}, 15000).
+
 -spec stop(pid()) -> ok.
 stop(Pid) ->
     %% An already-stopped election is this call's goal state, not an error.
@@ -132,6 +148,11 @@ init({Name, Key, TtlMs, Mod, Args, Opts}) ->
 
 handle_call(is_leader, _From, State) ->
     {reply, State#state.role =:= leader, State};
+handle_call({transfer_to, TargetNode}, _From, #state{role = leader} = State) ->
+    do_transfer_to(TargetNode, State);
+handle_call({transfer_to, _TargetNode}, _From, State) ->
+    %% Only the elected owner can transfer; a standby is not the owner.
+    {reply, {error, not_owner}, State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -147,7 +168,7 @@ handle_info(contend, State0) ->
         {ok, KA} ?= portunus_keepalive:start_link(State0#state.name, LeaseId,
                                                   State0#state.ttl_ms),
         State1 = State0#state{lease_id = LeaseId, keepalive = KA},
-        Owner = {election, node()},
+        Owner = node(),
         case portunus:acquire_or_join_succession_queue(
                State1#state.name, State1#state.key, LeaseId, Owner,
                #{affinity => State1#state.affinity}) of
@@ -226,6 +247,50 @@ become_leader(Token, #state{mod = Mod, name = Name, key = Key} = State) ->
             logger:warning("portunus election ~p failed to start (~p:~p); "
                            "releasing to re-contend", [Key, Class, Reason]),
             defer_contend(State)
+    end.
+
+%% A planned transfer. `stepped_down` runs before the command so a brief gap
+%% is preferred to two overlapping owners, and the pre-check refuses a
+%% not-ready target before any local work stops. On refusal or a command that
+%% did not commit the owner restores and stays; a lease that lapsed during the
+%% command re-contends without a second `stepped_down`.
+do_transfer_to(TargetNode, State) when TargetNode =:= node() ->
+    {reply, ok, State};
+do_transfer_to(TargetNode, #state{name = Name, key = Key, token = Token,
+                                  mod = Mod, cb_state = CbState} = State) ->
+    case is_ready_contender(Name, Key, TargetNode) of
+        false ->
+            %% Count the refusal here: the pre-check refuses before the command,
+            %% so the machine's counter never sees this common churn case.
+            _ = portunus_counters:incr(Name, transfer_no_contender_total),
+            {reply, {error, {no_contender, TargetNode}}, State};
+        true ->
+            _ = (catch Mod:stepped_down(CbState)),
+            case portunus:transfer(Name, Key, Token, TargetNode) of
+                ok ->
+                    teardown_lease(State),
+                    self() ! contend,
+                    {reply, ok, reset(State)};
+                {error, {no_contender, _}} = Err ->
+                    {reply, Err, become_leader(Token, State)};
+                {error, no_quorum} = Err ->
+                    {reply, Err, become_leader(Token, State)};
+                {error, not_owner} = Err ->
+                    %% Lease lapsed during the transfer: already lost, and
+                    %% `stepped_down` has run, so re-contend without repeating it.
+                    teardown_lease(State),
+                    self() ! contend,
+                    {reply, Err, reset(State)}
+            end
+    end.
+
+%% The transfer pre-check: is `TargetNode` a live contender for `Key`? A local,
+%% possibly-stale read; a failed read counts as not ready, so the owner is
+%% never stepped down for an unconfirmed target.
+is_ready_contender(Name, Key, TargetNode) ->
+    case portunus:contenders(Name, Key) of
+        {ok, Owners} -> lists:member(TargetNode, Owners);
+        {error, _} -> false
     end.
 
 %% Step down if we held the lock, then re-contend at once: a lost lease should

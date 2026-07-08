@@ -20,7 +20,16 @@
          replay_is_deterministic/1,
          membership_commands_are_noops/1,
          unknown_command_is_rejected/1,
-         overview_counts_state/1]).
+         overview_counts_state/1,
+         transfer_promotes_named_contender/1,
+         transfer_no_matching_contender_is_noop/1,
+         transfer_stale_token_is_not_owner/1,
+         transfer_free_key_is_not_owner/1,
+         transfer_to_self_is_ok/1,
+         transfer_promotes_pidless_contender/1,
+         transfer_prefers_higher_rank_same_owner/1,
+         transfer_watch_event_is_clean_handover/1,
+         query_contenders_lists_live_contenders/1]).
 
 %% This case feeds `apply/3` a command outside `command()` on purpose, to
 %% assert the catch-all rejects it; dialyzer correctly sees the call as
@@ -36,7 +45,16 @@ all() ->
      replay_is_deterministic,
      membership_commands_are_noops,
      unknown_command_is_rejected,
-     overview_counts_state].
+     overview_counts_state,
+     transfer_promotes_named_contender,
+     transfer_no_matching_contender_is_noop,
+     transfer_stale_token_is_not_owner,
+     transfer_free_key_is_not_owner,
+     transfer_to_self_is_ok,
+     transfer_promotes_pidless_contender,
+     transfer_prefers_higher_rank_same_owner,
+     transfer_watch_event_is_clean_handover,
+     query_contenders_lists_live_contenders].
 
 %% One lease holding two keys expires: both keys are released, and a key with
 %% a surviving waiter is promoted to it with a fresh grant.
@@ -142,6 +160,106 @@ overview_counts_state(_Config) ->
                  portunus_machine:query_status(S6)).
 
 %%----------------------------------------------------------------------
+%% A transfer names a later, non-best-ranked waiter: that exact contender is
+%% promoted, the token strictly increases, its lease pid gets the grant, and
+%% the other waiter stays queued.
+transfer_promotes_named_contender(_Config) ->
+    P3 = dummy_pid(),
+    S0 = new(),
+    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, Tok}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
+    {{ok, l2}, S3, _} = at({grant_lease, l2, 100000, o2, dummy_pid()}, 3, 0, S2),
+    {{ok, l3}, S4, _} = at({grant_lease, l3, 100000, o3, P3}, 4, 0, S3),
+    {{queued, 1}, S5, _} = at({acquire, l2, k, o2, undefined, wait}, 5, 0, S4),
+    {{queued, 2}, S6, _} = at({acquire, l3, k, o3, undefined, wait}, 6, 0, S5),
+    {ok, S7, Effs} = at({transfer, k, Tok, o3}, 7, 0, S6),
+    {ok, #{owner := o3, token := T7}} = portunus_machine:query_owner(k, S7),
+    ?assert(T7 > Tok),
+    ?assertNotEqual(false, grant_token(Effs, P3, k)),
+    [o2] = portunus_machine:query_contenders(k, S7).
+
+%% A transfer to an owner with no waiter changes nothing: the holder keeps the
+%% key at its current token.
+transfer_no_matching_contender_is_noop(_Config) ->
+    S0 = new(),
+    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, Tok}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
+    {{error, {no_contender, o2}}, S3, _} = at({transfer, k, Tok, o2}, 3, 0, S2),
+    {ok, #{owner := o1, token := Tok}} = portunus_machine:query_owner(k, S3).
+
+%% A transfer carrying a stale token is not_owner and changes nothing.
+transfer_stale_token_is_not_owner(_Config) ->
+    S0 = new(),
+    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, Tok}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
+    {{ok, l2}, S3, _} = at({grant_lease, l2, 100000, o2, dummy_pid()}, 3, 0, S2),
+    {{queued, 1}, S4, _} = at({acquire, l2, k, o2, undefined, wait}, 4, 0, S3),
+    {{error, not_owner}, S5, _} = at({transfer, k, Tok + 999, o2}, 5, 0, S4),
+    {ok, #{owner := o1, token := Tok}} = portunus_machine:query_owner(k, S5).
+
+%% A transfer of a free key is not_owner (the caller is not the holder).
+transfer_free_key_is_not_owner(_Config) ->
+    {{error, not_owner}, _, _} = at({transfer, k, 1, o2}, 1, 0, new()).
+
+%% A transfer to the holder's own owner returns ok and changes nothing.
+transfer_to_self_is_ok(_Config) ->
+    S0 = new(),
+    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, Tok}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
+    {ok, S3, _} = at({transfer, k, Tok, o1}, 3, 0, S2),
+    {ok, #{owner := o1, token := Tok}} = portunus_machine:query_owner(k, S3).
+
+%% A target whose lease has no monitored pid is still promoted; the match is on
+%% the owner term, so only the grant effect (which needs a pid) is absent.
+transfer_promotes_pidless_contender(_Config) ->
+    S0 = new(),
+    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, Tok}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
+    {{ok, l2}, S3, _} = at({grant_lease, l2, 100000, o2, undefined}, 3, 0, S2),
+    {{queued, 1}, S4, _} = at({acquire, l2, k, o2, undefined, wait}, 4, 0, S3),
+    {ok, S5, Effs} = at({transfer, k, Tok, o2}, 5, 0, S4),
+    {ok, #{owner := o2}} = portunus_machine:query_owner(k, S5),
+    [] = [M || {send_msg, _, {portunus, granted, _, _, _}} = M <- Effs].
+
+%% Two waiters share one owner term: the highest-ranked (higher score) is
+%% promoted, keeping the transition deterministic.
+transfer_prefers_higher_rank_same_owner(_Config) ->
+    P3 = dummy_pid(),
+    S0 = new(),
+    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, Tok}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
+    {{ok, l2}, S3, _} = at({grant_lease, l2, 100000, shared, dummy_pid()}, 3, 0, S2),
+    {{ok, l3}, S4, _} = at({grant_lease, l3, 100000, shared, P3}, 4, 0, S3),
+    {{queued, 1}, S5, _} = at({acquire, l2, k, shared, undefined, wait, 0}, 5, 0, S4),
+    {{queued, 2}, S6, _} = at({acquire, l3, k, shared, undefined, wait, 5}, 6, 0, S5),
+    {ok, S7, Effs} = at({transfer, k, Tok, shared}, 7, 0, S6),
+    ?assertNotEqual(false, grant_token(Effs, P3, k)),
+    {ok, #{owner := shared}} = portunus_machine:query_owner(k, S7).
+
+%% A watcher of a transferred key sees one clean ownership change to the new
+%% owner, never a transient release (the key is never free during a transfer).
+transfer_watch_event_is_clean_handover(_Config) ->
+    W = dummy_pid(),
+    S0 = new(),
+    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, Tok}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
+    {{ok, _Ref}, S3, _} = at({watch, k, W}, 3, 0, S2),
+    {{ok, l2}, S4, _} = at({grant_lease, l2, 100000, o2, dummy_pid()}, 4, 0, S3),
+    {{queued, 1}, S5, _} = at({acquire, l2, k, o2, undefined, wait}, 5, 0, S4),
+    {ok, _S6, Effs} = at({transfer, k, Tok, o2}, 6, 0, S5),
+    [{acquired, o2}] = [E || {send_msg, P, {portunus, watch, _, E}} <- Effs,
+                             P =:= W].
+
+%% `query_contenders/2` lists the owner terms of the live waiters on a key.
+query_contenders_lists_live_contenders(_Config) ->
+    S0 = new(),
+    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, _}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
+    [] = portunus_machine:query_contenders(k, S2),
+    {{ok, l2}, S3, _} = at({grant_lease, l2, 100000, o2, dummy_pid()}, 3, 0, S2),
+    {{queued, 1}, S4, _} = at({acquire, l2, k, o2, undefined, wait}, 4, 0, S3),
+    [o2] = portunus_machine:query_contenders(k, S4).
+
 %% Helpers
 %%----------------------------------------------------------------------
 

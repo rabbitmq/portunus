@@ -5,14 +5,20 @@
 // earlier candidate (lease id stands in for arrival order), matching the
 // machine's `{score, seq}` ranking; a re-enqueue refreshes the candidate's
 // bid. Mutual exclusion and fencing monotonicity must hold across every
-// interleaving of grant, acquire, enqueue, release, and batch expiry.
+// interleaving of grant, acquire, enqueue, release, batch expiry, and
+// targeted transfer.
 // Release is token-fenced, as in the implementation: a release carrying a
 // stale token replies `{error, not_owner}` and changes nothing
 // (`staleRelease`). Strict per-key token increase is asserted at mint time
 // through the `lastMinted` history map, so a mutant that re-mints an old
 // token is caught even when the watermark checks still pass.
 //
-// `expireBatch` models one command revoking several leases at once — a tick
+// Targeted transfer (`transfer`) hands a held key to the contender named by
+// its `owner` term under the same token fence; `targetedHandover` asserts it
+// promotes that contender and no other, catching a mutant that falls back to
+// the best-ranked one.
+//
+// `expireBatch` models one command revoking several leases at once: a tick
 // catching several expiries, or one pid's death revoking every lease it
 // held. Every token minted by one command carries that command's single
 // Raft index, and a queued successor can itself be among the revoked: a
@@ -28,7 +34,7 @@
 // the same invariants exhaustively over small bounds.
 //
 //   quint typecheck quint/portunus_machine.qnt
-//   quint run       quint/portunus_machine.qnt --invariants mutualExclusion fencingMonotonic mintStrictlyIncreases
+//   quint run       quint/portunus_machine.qnt --invariants mutualExclusion fencingMonotonic mintStrictlyIncreases targetedHandover
 //   quint run       quint/portunus_machine.qnt --witnesses succession handover
 //   quint verify    quint/portunus_machine.qnt --invariant=safety
 //
@@ -52,7 +58,7 @@ module portunus_machine {
   // Per key, the highest token ever issued for it.
   var maxToken: int -> int
   // Monotonic source of fencing tokens: the Raft index, bumped once per
-  // command that mints — every mint in one command shares its value.
+  // command that mints. Every mint in one command shares its value.
   var index: int
   // History: per key, the most recent token minted for it, and whether any
   // mint ever failed to strictly increase past it. Only mints record these;
@@ -60,6 +66,9 @@ module portunus_machine {
   // may legitimately mint its one index for several *different* keys.
   var lastMinted: int -> int
   var mintRegressed: bool
+  // History: set once if any transfer ever promoted a lease other than the
+  // one it named. `targetedHandover` reads it.
+  var transferMisdirected: bool
 
   def ownersOf(k) = held.filter(p => p._1 == k)
   def free(k) = ownersOf(k).size() == 0
@@ -67,7 +76,7 @@ module portunus_machine {
   def bidsOf(k) = candidates.filter(w => w._1 == k).map(w => (w._2, w._3))
 
   // (lease, score) `a` is promoted before `b`: higher score, earlier
-  // arrival on a tie — the machine's `{score, seq}` rank.
+  // arrival on a tie: the machine's `{score, seq}` rank.
   pure def outranks(a: (int, int), b: (int, int)): bool =
     a._2 > b._2 or (a._2 == b._2 and a._1 < b._1)
 
@@ -104,6 +113,7 @@ module portunus_machine {
     index' = 0,
     lastMinted' = Keys.mapBy(_ => 0),
     mintRegressed' = false,
+    transferMisdirected' = false,
   }
 
   action grant(l) = all {
@@ -116,6 +126,7 @@ module portunus_machine {
     index' = index,
     lastMinted' = lastMinted,
     mintRegressed' = mintRegressed,
+    transferMisdirected' = transferMisdirected,
   }
 
   action acquire(l, k) = all {
@@ -130,6 +141,7 @@ module portunus_machine {
     lastMinted' = lastMinted.set(k, index + 1),
     // Parenthesized: `x' = a or b` would parse as `(x' = a) or b`.
     mintRegressed' = (mintRegressed or index + 1 <= lastMinted.get(k)),
+    transferMisdirected' = transferMisdirected,
   }
 
   // A lease queues on a held key with a score; queueing again replaces its
@@ -147,6 +159,7 @@ module portunus_machine {
     index' = index,
     lastMinted' = lastMinted,
     mintRegressed' = mintRegressed,
+    transferMisdirected' = transferMisdirected,
   }
 
   // `release/2` carrying the owner's current token: frees the key and
@@ -164,12 +177,13 @@ module portunus_machine {
       maxToken' = if (promotee != 0) maxToken.set(k, index + 1) else maxToken,
       lastMinted' = if (promotee != 0) lastMinted.set(k, index + 1) else lastMinted,
       mintRegressed' = (mintRegressed or (promotee != 0 and index + 1 <= lastMinted.get(k))),
+      transferMisdirected' = transferMisdirected,
     },
     alive' = alive,
   }
 
   // A release carrying a stale token: the machine replies `{error,
-  // not_owner}` and changes nothing — the fence that keeps an ex-owner's
+  // not_owner}` and changes nothing: the fence that keeps an ex-owner's
   // belated release from freeing its successor's key.
   action staleRelease(k, t) = all {
     t != tokenOf.get(k),
@@ -181,13 +195,14 @@ module portunus_machine {
     index' = index,
     lastMinted' = lastMinted,
     mintRegressed' = mintRegressed,
+    transferMisdirected' = transferMisdirected,
   }
 
-  // One command revokes the whole set `ls` — a tick catching several
+  // One command revokes the whole set `ls`: a tick catching several
   // expiries, or one pid's death revoking every lease it held. Freed keys
   // promote the best-ranked candidate, skipping the command's own revoking
   // leases; every mint carries the command's one index, so a
-  // second grant for the same key would re-mint an equal token — exactly
+  // second grant for the same key would re-mint an equal token: exactly
   // what `mintStrictlyIncreases` rejects.
   action expireBatch(ls) = all {
     ls != Set(),
@@ -217,7 +232,37 @@ module portunus_machine {
       // recorded.
       mintRegressed' = (mintRegressed or minted.exists(k =>
         index + 1 <= lastMinted.get(k) or grantCount(k, ls) >= 2)),
+      transferMisdirected' = transferMisdirected,
     },
+  }
+
+  // Targeted transfer: the holder of key `k`, fenced by its token `t`, hands
+  // it to the contender named by `target`, with a new token from this
+  // command's index. The machine matches a waiter by its `owner` term
+  // (`owner =:= TargetOwner`); here the lease id stands for that identity, so
+  // no pid or node is involved. Unlike `release`, it promotes the named
+  // contender, not the best-ranked one. A stale `t`, or a `target` not queued
+  // on `k`, disables the action; since the model tracks only state, that no-op
+  // stands for both the machine's `no_contender` refusal and its self-transfer
+  // no-op (the holder is not its own candidate).
+  action transfer(k, t, target) = all {
+    not(free(k)),
+    t == tokenOf.get(k),
+    bidsOf(k).exists(b => b._1 == target),
+    // MUTATION for the targeting check (expect `targetedHandover` to fail):
+    //   val promoted = promoteeOf(k, Set())
+    val promoted = target
+    all {
+      held' = held.filter(p => p._1 != k).union(Set((k, promoted))),
+      candidates' = candidates.filter(w => not(w._1 == k and w._2 == promoted)),
+      index' = index + 1,
+      tokenOf' = tokenOf.set(k, index + 1),
+      maxToken' = maxToken.set(k, index + 1),
+      lastMinted' = lastMinted.set(k, index + 1),
+      mintRegressed' = (mintRegressed or index + 1 <= lastMinted.get(k)),
+      transferMisdirected' = (transferMisdirected or promoted != target),
+    },
+    alive' = alive,
   }
 
   action step = any {
@@ -238,6 +283,10 @@ module portunus_machine {
     staleRelease(k, t),
     nondet ls = Leases.powerset().oneOf()
     expireBatch(ls),
+    nondet k = Keys.oneOf()
+    nondet t = 0.to(index).oneOf()
+    nondet target = Leases.oneOf()
+    transfer(k, t, target),
   }
 
   // At most one lease holds any key.
@@ -254,12 +303,18 @@ module portunus_machine {
   // one command's chained double promotion).
   val mintStrictlyIncreases = not(mintRegressed)
 
+  // A transfer promotes exactly the contender it names, never a third lease.
+  // Recorded as the transfer runs, like `mintRegressed`, so a mutant that
+  // promotes the best-ranked candidate instead of the named one is caught.
+  val targetedHandover = not(transferMisdirected)
+
   val safety = mutualExclusion and fencingMonotonic and mintStrictlyIncreases
+    and targetedHandover
 
   // Witnesses (`quint run --witnesses`): states the invariants are only
   // meaningful if the simulator actually reaches. `succession` is a key
   // with an owner and queued candidates; `handover` is a key freed after
-  // ownership — the promotion paths the mint checks guard.
+  // ownership: the promotion paths the mint checks guard.
   val succession = Keys.exists(k => not(free(k)) and bidsOf(k).size() > 0)
   val handover = Keys.exists(k => tokenOf.get(k) == 0 and maxToken.get(k) > 0)
 }

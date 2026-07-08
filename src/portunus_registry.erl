@@ -38,7 +38,7 @@ supervising it should give it a generous `shutdown` value.
 -behaviour(portunus_election).
 
 -export([start_link/2, start_link/3, add/2, add/3, remove/2, keys/1,
-         owned_keys/1, which_children/1, stop/1]).
+         owned_keys/1, which_children/1, transfer/3, stop/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 %% portunus_election callbacks
 -export([elected/1, stepped_down/1]).
@@ -151,6 +151,17 @@ The children this node currently runs (it was elected for), in
 which_children(Server) ->
     gen_server:call(Server, which_children, infinity).
 
+-doc """
+If this node currently owns `Key`, hand ownership to `TargetNode`; if not,
+return `{error, not_owner}`. Only the owner can transfer. If
+`TargetNode` is not a ready contender the owner keeps running and the reply is
+`{error, {no_contender, TargetNode}}`, never a handoff to some other node.
+""".
+-spec transfer(server(), term(), node()) ->
+    portunus:ok_or_error({no_contender, node()} | not_owner | no_quorum).
+transfer(Server, Key, TargetNode) ->
+    gen_server:call(Server, {transfer, Key, TargetNode}, infinity).
+
 -spec stop(server()) -> ok.
 stop(Server) ->
     %% An already-stopped registry is this call's goal state, not an error.
@@ -214,6 +225,19 @@ handle_call(owned_keys, From, #state{elections = Elections} = State) ->
     {noreply, State};
 handle_call(which_children, _From, #state{local_sup = LocalSup} = State) ->
     {reply, supervisor:which_children(LocalSup), State};
+handle_call({transfer, Key, TargetNode}, From,
+            #state{elections = Elections} = State) ->
+    case maps:find(Key, Elections) of
+        {ok, {Pid, _Spec}} when is_pid(Pid) ->
+            %% Offloaded so the registry stays responsive to other keys while
+            %% one election runs its `stepped_down` and the fenced command,
+            %% the same shape `owned_keys` uses.
+            _ = spawn(fun() -> gen_server:reply(From, transfer_to(Pid, TargetNode)) end),
+            {noreply, State};
+        _ ->
+            %% No live election here for the key: this node is not its owner.
+            {reply, {error, not_owner}, State}
+    end;
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -330,6 +354,13 @@ election_of(Pid, Elections) ->
     case [{K, S} || {K, {P, S}} <- maps:to_list(Elections), P =:= Pid] of
         [{Key, Spec}] -> {Key, Spec};
         [] -> not_found
+    end.
+
+%% A wedged or timed-out election surfaces as a transient `no_quorum` the
+%% caller retries, rather than crashing the spawned reply process unreplied.
+transfer_to(Pid, TargetNode) ->
+    try portunus_election:transfer_to(Pid, TargetNode)
+    catch exit:_ -> {error, no_quorum}
     end.
 
 %% An election blocked in a Ra command (a quorum loss, a slow child start)
