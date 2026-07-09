@@ -1,0 +1,47 @@
+name: Test
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+jobs:
+  build:
+    name: "build (Erlang/OTP ${{ matrix.otp_version }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Resolved by setup-beam to the latest patch release of each series.
+        otp_version: ['27.3', '28.5', '29.0']
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Configure Erlang
+      uses: erlef/setup-beam@v1
+      id: install-erlang
+      with:
+        otp-version: ${{ matrix.otp_version }}
+        rebar3-version: '3.25.1'
+    - name: Update Hex registry
+      run: rebar3 update
+    - name: Xref
+      run: rebar3 xref
+    - name: Restore Dialyzer PLT files from cache
+      uses: actions/cache@v5
+      with:
+        path: _build/*/rebar3_*_plt
+        key: dialyzer-plt-cache-${{ steps.install-erlang.outputs.otp-version }}-${{ runner.os }}-${{ hashFiles('rebar.config*') }}-v1
+    - name: Dialyze
+      run: rebar3 dialyzer
+    - name: Build
+      run: rebar3 compile
+    - name: EUnit
+      run: rebar3 eunit
+    - name: Common Test
+      run: rebar3 ct
+    - name: Capture test logs on failure
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: ct-logs-${{ matrix.otp_version }}
+        path: _build/test/logs

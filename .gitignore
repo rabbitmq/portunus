@@ -4,15 +4,30 @@ deps/
 HANDOFF.md
 ebin/
 .erlang.mk/
+plugins/
 *.beam
 *.plt
 *.d
 erl_crash.dump
+.sw?
+.*.sw?
 logs/
 doc/
 cover/
 _checkouts/
 .rebar3/
 rebar.lock
+xrefr
+callgrind*
+ct.coverdata
+test/ct.cover.spec
+
+# Ra node runtime artifacts
+config
+*.dets
+*.wal
+*.segment
 
 _apalache-out/*
+
+/.vscode/
