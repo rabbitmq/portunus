@@ -29,9 +29,11 @@
 // chain fails `mintStrictlyIncreases` (see the mutation note at
 // `grantCount`).
 //
-// This is the abstract counterpart to portunus_machine_model_prop_SUITE: PropEr
-// samples random command sequences against the real apply/3, while this checks
-// the same invariants exhaustively over small bounds.
+// This is the abstract counterpart to the PropEr suites: they sample the
+// real `apply/3` (`portunus_machine_model_prop_SUITE` for random acquire and
+// release sequences, `portunus_succession_prop_SUITE` and
+// `portunus_transfer_prop_SUITE` for succession and transfer), while this
+// checks the same invariants exhaustively over small bounds.
 //
 //   quint typecheck quint/portunus_machine.qnt
 //   quint run       quint/portunus_machine.qnt --invariants mutualExclusion fencingMonotonic mintStrictlyIncreases targetedHandover
@@ -241,10 +243,9 @@ module portunus_machine {
   // command's index. The machine matches a waiter by its `owner` term
   // (`owner =:= TargetOwner`); here the lease id stands for that identity, so
   // no pid or node is involved. Unlike `release`, it promotes the named
-  // contender, not the best-ranked one. A stale `t`, or a `target` not queued
-  // on `k`, disables the action; since the model tracks only state, that no-op
-  // stands for both the machine's `no_contender` refusal and its self-transfer
-  // no-op (the holder is not its own candidate).
+  // contender, not the best-ranked one. The refused cases are `staleTransfer`
+  // below; the machine's self-transfer no-op has no counterpart here because
+  // the holder is never its own candidate (`enqueue` excludes it).
   action transfer(k, t, target) = all {
     not(free(k)),
     t == tokenOf.get(k),
@@ -263,6 +264,24 @@ module portunus_machine {
       transferMisdirected' = (transferMisdirected or promoted != target),
     },
     alive' = alive,
+  }
+
+  // A transfer the machine refuses: a stale token (`{error, not_owner}`) or a
+  // target with no live bid on the key (`{error, {no_contender, _}}`). A
+  // no-op, mirroring `staleRelease`. The fence itself cannot be asserted by
+  // these state invariants (an unfenced move still leaves one owner and a
+  // fresh token); the unit and property suites assert it against `apply/3`.
+  action staleTransfer(k, t, target) = all {
+    t != tokenOf.get(k) or not(bidsOf(k).exists(b => b._1 == target)),
+    held' = held,
+    candidates' = candidates,
+    tokenOf' = tokenOf,
+    alive' = alive,
+    maxToken' = maxToken,
+    index' = index,
+    lastMinted' = lastMinted,
+    mintRegressed' = mintRegressed,
+    transferMisdirected' = transferMisdirected,
   }
 
   action step = any {
@@ -287,6 +306,10 @@ module portunus_machine {
     nondet t = 0.to(index).oneOf()
     nondet target = Leases.oneOf()
     transfer(k, t, target),
+    nondet k = Keys.oneOf()
+    nondet t = 0.to(index).oneOf()
+    nondet target = Leases.oneOf()
+    staleTransfer(k, t, target),
   }
 
   // At most one lease holds any key.
@@ -308,8 +331,14 @@ module portunus_machine {
   // promotes the best-ranked candidate instead of the named one is caught.
   val targetedHandover = not(transferMisdirected)
 
+  // Every holder and every candidate is a live lease: the machine's
+  // counterpart is that revocation and promotion prune dead waiters, so
+  // a mutant that forgets a pruning step in `expireBatch` fails here.
+  val holdersAlive = held.forall(p => alive.contains(p._2))
+    and candidates.forall(w => alive.contains(w._2))
+
   val safety = mutualExclusion and fencingMonotonic and mintStrictlyIncreases
-    and targetedHandover
+    and targetedHandover and holdersAlive
 
   // Witnesses (`quint run --witnesses`): states the invariants are only
   // meaningful if the simulator actually reaches. `succession` is a key
