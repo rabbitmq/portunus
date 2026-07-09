@@ -55,6 +55,9 @@ on external resources.
                 token :: portunus:option(portunus:token()),
                 cb_state :: term(),
                 role = follower :: follower | leader,
+                %% A transfer command timed out: its outcome is unknown until
+                %% the reconciliation read confirms who owns the key.
+                pending_transfer = false :: boolean(),
                 reconcile = 0 :: non_neg_integer()}).
 
 -type election_opts() :: #{ttl_ms => pos_integer(),
@@ -94,7 +97,11 @@ contender, stops the local work, issues the token-fenced transfer, and on
 success re-contends as a standby; if the target was not ready it restores the
 local work and stays owner. Returns `{error, not_owner}` when this node is not
 the owner, and `{error, {no_contender, TargetNode}}` when the target is not a
-ready contender.
+ready contender. `{error, no_quorum}` means the command timed out and its
+outcome is unknown: the work stays stopped while the election settles
+ownership itself (restoring it or re-contending), so the caller retries later
+rather than treating it as a failed transfer. A retry made before that
+settles also returns `{error, not_owner}`; it does not prove ownership moved.
 """.
 -spec transfer_to(pid(), node()) ->
     portunus:ok_or_error({no_contender, node()} | not_owner | no_quorum).
@@ -188,10 +195,14 @@ handle_info(contend, State0) ->
             {noreply, State0#state{role = follower}}
     end;
 handle_info({portunus, granted, Key, Token, LeaseId},
-            #state{key = Key, lease_id = LeaseId, role = follower} = State) ->
-    %% Matching lease_id drops a grant minted for an earlier contend that
+            #state{key = Key, lease_id = LeaseId, role = follower,
+                   pending_transfer = false} = State) ->
+    %% Matching `lease_id` drops a grant minted for an earlier contend that
     %% we have since abandoned, which would otherwise install us as leader
-    %% on a revoked token.
+    %% on a revoked token. While a transfer outcome is pending this clause
+    %% does not match: a delayed grant from before the transfer would
+    %% restart the work on a stale token, so only the reconciliation read may
+    %% restore leadership until the flag clears.
     {noreply, become_leader(Token, State)};
 handle_info({portunus, lease_lost, LeaseId},
             #state{lease_id = LeaseId} = State) ->
@@ -209,7 +220,16 @@ handle_info({reconcile, Gen}, #state{reconcile = Gen, role = follower,
     %% queue (a re-acquire would reset our arrival order).
     case portunus:owner(Name, Key) of
         {ok, #{lease := LeaseId, token := Token}} ->
-            {noreply, become_leader(Token, State)};
+            {noreply, become_leader(Token, State#state{pending_transfer = false})};
+        {error, no_quorum} ->
+            {noreply, schedule_reconcile(State)};
+        _ when State#state.pending_transfer ->
+            %% The timed-out transfer committed (or the key has since moved
+            %% on): this node no longer holds it, so drop the lease and
+            %% re-contend. `stepped_down` already ran before the command.
+            teardown_lease(State),
+            self() ! contend,
+            {noreply, reset(State)};
         _ ->
             {noreply, schedule_reconcile(State)}
     end;
@@ -251,9 +271,11 @@ become_leader(Token, #state{mod = Mod, name = Name, key = Key} = State) ->
 
 %% A planned transfer. `stepped_down` runs before the command so a brief gap
 %% is preferred to two overlapping owners, and the pre-check refuses a
-%% not-ready target before any local work stops. On refusal or a command that
-%% did not commit the owner restores and stays; a lease that lapsed during the
-%% command re-contends without a second `stepped_down`.
+%% not-ready target before any local work stops. A committed refusal
+%% (`no_contender`) restores the owner; a lease that lapsed during the command
+%% (`not_owner`) re-contends without a second `stepped_down`; a timed-out
+%% command (`no_quorum`) has an unknown outcome and is resolved by the
+%% reconciliation read before the work restarts anywhere.
 do_transfer_to(TargetNode, State) when TargetNode =:= node() ->
     {reply, ok, State};
 do_transfer_to(TargetNode, #state{name = Name, key = Key, token = Token,
@@ -274,7 +296,17 @@ do_transfer_to(TargetNode, #state{name = Name, key = Key, token = Token,
                 {error, {no_contender, _}} = Err ->
                     {reply, Err, become_leader(Token, State)};
                 {error, no_quorum} = Err ->
-                    {reply, Err, become_leader(Token, State)};
+                    %% The command timed out, so it may still commit. Restarting
+                    %% the work on the old token would run it on two nodes if it
+                    %% did (the target is granted while this node keeps going),
+                    %% and nothing would ever correct that: the keepalive keeps
+                    %% the lease alive, so no `lease_lost` arrives. Keep the work
+                    %% stopped and the lease renewing until the reconciliation read
+                    %% answers: if this node still owns the key the work is
+                    %% restored, otherwise the election re-contends.
+                    {reply, Err,
+                     schedule_reconcile(State#state{role = follower,
+                                                    pending_transfer = true})};
                 {error, not_owner} = Err ->
                     %% Lease lapsed during the transfer: already lost, and
                     %% `stepped_down` has run, so re-contend without repeating it.
@@ -322,7 +354,8 @@ teardown_lease(#state{name = Name, lease_id = LeaseId, keepalive = KA}) ->
 
 reset(State) ->
     State#state{role = follower, lease_id = undefined, keepalive = undefined,
-                token = undefined, cb_state = undefined}.
+                token = undefined, cb_state = undefined,
+                pending_transfer = false}.
 
 %% Re-check ownership at the renewal cadence: often enough to recover a lost
 %% promotion well within the lease, rare enough to be a cheap backstop. Each

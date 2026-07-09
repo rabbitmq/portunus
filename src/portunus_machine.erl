@@ -614,11 +614,13 @@ do_transfer(Meta, LockKey, OldLeaseId, TargetOwner, State0) ->
              [incr(transfer_no_contender_total, State0)]};
         _ ->
             #waiter{lease_id = NewLeaseId, seq = Seq} = Best = best_waiter(Matching),
-            %% Drop the key from the current holder, keep every other waiter.
+            %% Drop the key from the current holder; keep the other live
+            %% waiters, pruning dead ones as a lapse promotion does.
             OldLease = maps:get(OldLeaseId, State0#?MODULE.leases),
             OldLease1 = OldLease#lease{keys = maps:remove(LockKey,
                                                           OldLease#lease.keys)},
-            Rest = [W || W <- Ws0, W#waiter.seq =/= Seq],
+            Rest = [W || W <- Ws0, W#waiter.seq =/= Seq,
+                         maps:is_key(W#waiter.lease_id, State0#?MODULE.leases)],
             State1 = set_waiters(LockKey, Rest,
                                  set_lease(OldLeaseId, OldLease1, State0)),
             %% Install the target as the new holder with a fresh token.
