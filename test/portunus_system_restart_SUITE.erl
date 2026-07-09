@@ -9,7 +9,7 @@
 
 %% `start_system/2` must survive a restart of the `ra` application, which a host
 %% such as RabbitMQ does during boot. The Ra system's config lives in a
-%% persistent_term that outlives the system's processes, so a guard on
+%% `persistent_term` that outlives the system's processes, so a guard on
 %% `ra_system:fetch/1` would skip re-initialisation and leave a stale shell
 %% whose ETS tables are gone. These tests restart `ra` under a running cluster
 %% and assert the system and its locks come back.
@@ -71,7 +71,7 @@ start_system_is_idempotent(Config) ->
     ?assertMatch({ok, _}, portunus:grant_lease(?NAME, ?TTL)).
 
 %% After the `ra` application restarts, the system's config still sits in a
-%% persistent_term, but its processes and tables are gone. `start_system/2` must
+%% `persistent_term`, but its processes and tables are gone. `start_system/2` must
 %% rebuild it: forming a cluster and granting a lease would fail on a stale
 %% shell.
 start_system_reinitialises_after_ra_restart(Config) ->
@@ -176,7 +176,7 @@ already_present_child_is_dropped_and_restarted(Config) ->
 %%----------------------------------------------------------------------
 
 %% Stop and restart the `ra` application, as a host does on a node restart. The
-%% on-disk data dir survives; the persistent_term config survives; the
+%% on-disk data dir survives; the `persistent_term` config survives; the
 %% processes and ETS tables do not.
 restart_ra_app() ->
     ok = application:stop(ra),

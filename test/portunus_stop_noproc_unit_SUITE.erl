@@ -8,8 +8,8 @@
 
 %% `unlock/1` and `with_lock/4` must survive a renewer that already stopped
 %% itself after `lease_lost`: without the `noproc` catch the `gen_server:stop` on the
-%% dead pid crashed the caller with `noproc`, precisely after the quorum
-%% outage it most needed to survive.
+%% dead pid crashed the caller with `noproc` right after a quorum outage,
+%% when callers must keep running.
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").

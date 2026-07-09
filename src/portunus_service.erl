@@ -41,6 +41,7 @@ default is FIFO in arrival (registration) order.
 %% portunus_election callbacks
 -export([elected/1, stepped_down/1]).
 
+%% Duplicate keys are collapsed: the set is one election per distinct key.
 -callback keys(term()) -> [term()].
 -callback start(term(), portunus:token(), term()) -> {ok, term()}.
 -callback stop(term(), term()) -> ok.

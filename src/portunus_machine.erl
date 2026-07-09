@@ -28,7 +28,7 @@ the decision is always re-derived from replicated state.
          version/0,
          which_module/1]).
 
-%% Exported for queries run via ra:consistent_query/local_query.
+%% Exported for queries run via `ra:consistent_query/3` or `ra:local_query/3`.
 -export([query_owner/2,
          query_contenders/2,
          query_status/1]).
@@ -61,6 +61,7 @@ the decision is always re-derived from replicated state.
          integer()} |
         {release, lock_key(), token()} |
         {transfer, lock_key(), token(), owner()} |
+        {leave_queue, lock_key(), lease_id()} |
         {watch, lock_key(), pid()} |
         {unwatch, watch_ref()} |
         {timeout, expire} |
@@ -256,6 +257,20 @@ do_apply(Meta, {transfer, LockKey, Token, TargetOwner}, State0) ->
         error ->
             {State0, {error, not_owner}}
     end;
+%% Withdraw a lease's succession bid on one key: `release` for waiters. No
+%% token moves and no promotion runs, so the key's holder is untouched. A
+%% lease with no bid on the key (including the holder itself) gets
+%% `{error, not_queued}` and nothing changes.
+do_apply(_Meta, {leave_queue, LockKey, LeaseId}, State0) ->
+    Ws0 = maps:get(LockKey, State0#?MODULE.leader_succession_queue, []),
+    case [W || W <- Ws0, W#waiter.lease_id =:= LeaseId] of
+        [] ->
+            {State0, {error, not_queued}};
+        _ ->
+            Ws1 = [W || W <- Ws0, W#waiter.lease_id =/= LeaseId],
+            State1 = set_waiters(LockKey, Ws1, State0),
+            {State1, ok, [incr(queue_leaves_total, State1)]}
+    end;
 %% A non-pid here would crash every successive leader through the monitor
 %% effect and `state_enter/2`'s re-derivation, hence the guard.
 do_apply(Meta, {watch, LockKey, Pid}, State0) when is_pid(Pid) ->
@@ -417,7 +432,7 @@ version() -> 0.
 which_module(0) -> ?MODULE.
 
 %%----------------------------------------------------------------------
-%% Query funs (run on a replica via ra:consistent_query/local_query)
+%% Query funs (run on a replica via `ra:consistent_query/3` or `ra:local_query/3`)
 %%----------------------------------------------------------------------
 
 -spec query_owner(lock_key(), state()) ->

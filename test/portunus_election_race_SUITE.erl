@@ -7,9 +7,9 @@
 -module(portunus_election_race_SUITE).
 
 %% The election is a gen_server, so it processes one message at a time: its
-%% "races" are just the order in which granted/lease_lost/EXIT arrive. With the
+%% "races" are just the order in which `granted`, `lease_lost`, and `'EXIT'` arrive. With the
 %% Ra boundary mocked, the real election is driven through each ordering and
-%% must keep elected/stepped_down correctly paired and never act on a lease it
+%% must keep `elected/1` and `stepped_down/1` correctly paired and never act on a lease it
 %% has abandoned. No Concuerror: a single gen_server has no internal
 %% concurrency to explore, and the orderings that matter are few enough to list.
 

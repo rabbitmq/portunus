@@ -10,7 +10,7 @@ Rate-limited restarts for plain Erlang/OTP supervisors, accepting the extended
 `supervisor2` restart type without a dependency on `supervisor2`.
 
 `mirrored_supervisor` is built on rabbit's `supervisor2`, which accepts an
-extended restart type `{permanent, Delay}` / `{transient, Delay}` (Delay
+extended restart type `{permanent, Delay}` or `{transient, Delay}` (Delay
 in seconds). A child spec ported from `mirrored_supervisor` can carry that
 form; `portunus` runs elected children under a plain Erlang/OTP
 `supervisor`, which rejects it.

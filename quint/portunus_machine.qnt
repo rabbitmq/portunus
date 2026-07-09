@@ -5,8 +5,8 @@
 // earlier candidate (lease id stands in for arrival order), matching the
 // machine's `{score, seq}` ranking; a re-enqueue refreshes the candidate's
 // bid. Mutual exclusion and fencing monotonicity must hold across every
-// interleaving of grant, acquire, enqueue, release, batch expiry, and
-// targeted transfer.
+// interleaving of grant, acquire, enqueue, queue leave, release, batch
+// expiry, and targeted transfer.
 // Release is token-fenced, as in the implementation: a release carrying a
 // stale token replies `{error, not_owner}` and changes nothing
 // (`staleRelease`). Strict per-key token increase is asserted at mint time
@@ -266,6 +266,23 @@ module portunus_machine {
     alive' = alive,
   }
 
+  // Withdraw a lease's bid on a key: `release` for waiters. No mint, no
+  // promotion, and the holder is untouched, so every invariant is
+  // preserved trivially; the action exists so the simulator explores
+  // queues that shrink without a lease dying.
+  action leaveQueue(l, k) = all {
+    candidates.exists(w => w._1 == k and w._2 == l),
+    candidates' = candidates.filter(w => not(w._1 == k and w._2 == l)),
+    alive' = alive,
+    held' = held,
+    tokenOf' = tokenOf,
+    maxToken' = maxToken,
+    index' = index,
+    lastMinted' = lastMinted,
+    mintRegressed' = mintRegressed,
+    transferMisdirected' = transferMisdirected,
+  }
+
   // A transfer the machine refuses: a stale token (`{error, not_owner}`) or a
   // target with no live bid on the key (`{error, {no_contender, _}}`). A
   // no-op, mirroring `staleRelease`. The fence itself cannot be asserted by
@@ -310,6 +327,9 @@ module portunus_machine {
     nondet t = 0.to(index).oneOf()
     nondet target = Leases.oneOf()
     staleTransfer(k, t, target),
+    nondet l = Leases.oneOf()
+    nondet k = Keys.oneOf()
+    leaveQueue(l, k),
   }
 
   // At most one lease holds any key.
@@ -322,7 +342,7 @@ module portunus_machine {
 
   // Every mint for a key strictly increased past that key's previous one, so
   // a key's tokens never repeat. That's the half of the fencing claim the
-  // watermark checks above cannot post (re-minting the current maximum, or
+  // watermark checks above cannot catch (re-minting the current maximum, or
   // one command's chained double promotion).
   val mintStrictlyIncreases = not(mintRegressed)
 

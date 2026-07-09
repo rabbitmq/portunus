@@ -53,7 +53,8 @@ majority, and so never reaches the machine.
          {lease_expiries_total,    16, counter, "Leases expired without renewal"},
          {failures_due_to_lack_of_online_quorum_total, 17, counter, "Commands and queries that failed because there was no online quorum (majority)"},
          {transfers_total,         18, counter, "Targeted ownership transfers that handed a key to a named node"},
-         {transfer_no_contender_total, 19, counter, "Targeted transfers refused because the target was not a ready contender"}]).
+         {transfer_no_contender_total, 19, counter, "Targeted transfers refused because the target was not a ready contender"},
+         {queue_leaves_total,      20, counter, "Succession bids withdrawn with leave_succession_queue"}]).
 
 -doc "Create the seshat group and register the field spec. Idempotent.".
 -spec init() -> ok.

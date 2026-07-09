@@ -334,6 +334,24 @@ fun:
 #{affinity => {metric, fun() -> spare_capacity() end}}
 ```
 
+## Leaving a Succession Queue
+
+A queued contender that no longer wants a key withdraws its bid with
+`leave_succession_queue/3`. The current holder and the lease's other
+claims are untouched, and the next promotion skips the leaver:
+
+```erlang
+{ok, Lease} = portunus:grant_lease(my_locks, 30000),
+{queued, _} = portunus:acquire_or_join_succession_queue(my_locks, Key, Lease,
+                                                        self()),
+%% this process is no longer interested in Key; the lease lives on and
+%% other keys claimed under it are unaffected
+ok = portunus:leave_succession_queue(my_locks, Key, Lease).
+```
+
+Without this, the only way out of a queue is revoking the lease, which
+drops every other key held under it.
+
 ## Node Restarts and Membership Changes
 
 Membership is managed with `add_member/2`, `remove_member/2`, and

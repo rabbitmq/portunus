@@ -11,7 +11,7 @@
 %% release, this interleaves grant, renew, revoke, and monitor-driven `down`
 %% as well, so cross-command paths (release_pid, multi-key revoke) are
 %% exercised together. Waiter succession is covered in
-%% portunus_succession_prop_SUITE; this run uses nowait acquires only.
+%% `portunus_succession_prop_SUITE`; this run uses `nowait` acquires only.
 
 -include_lib("proper/include/proper.hrl").
 

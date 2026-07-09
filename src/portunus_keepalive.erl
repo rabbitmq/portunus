@@ -7,18 +7,18 @@
 -module(portunus_keepalive).
 -moduledoc """
 This module implements automatic background lease renewals
-for a holder that is an Erlang process (a PID).
+for a holder that is an Erlang process.
 
 It is linked to the caller (usually the resource holder) and
 traps exits.
 
 If the resource holder process dies, the renewer stops.
-Owners that can be restarted should make sure to set up
-the renewer in their init function.
+Owners that can be restarted should set up the renewer in
+their init function.
 
-While this module can be used directly, it is likely that
-the lease keepalive will be set up by higher level functions
-such as `portunus:grant_lease/3` with the `auto_renew` option or `portunus:lock/3`.
+This module can be used directly, but is usually set up through
+`portunus:grant_lease/3` with the `auto_renew` option, or
+`portunus:lock/3`.
 
 `LeaseId` is renewed every `max(TTL/3, 1000)` milliseconds, and the
 minimum supported TTL is 2000 ms, allowing for at least two renewal

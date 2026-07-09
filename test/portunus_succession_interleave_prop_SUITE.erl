@@ -9,7 +9,8 @@
 
 %% Where `portunus_succession_prop` checks that releasing a holder promotes the
 %% right waiter, this interleaves queued `wait` acquires with the other ways a
-%% holder leaves (`revoke`, a monitored `down`, and lease expiry) and asserts
+%% holder leaves (`revoke`, a monitored `down`, and lease expiry), plus
+%% waiters withdrawing their bids (`leave_queue`), and asserts
 %% the safety net after every step: at most one owner per key, an owner whose
 %% lease is still live, fencing tokens that never regress, and the property that
 %% catches a dropped promotion, namely a key held exactly when some live lease
@@ -55,6 +56,7 @@ op() ->
            {revoke, oneof(?LEASES)},
            {down, oneof(?LEASES)},
            {down_noconn, oneof(?LEASES)},
+           {leave, oneof(?LEASES), oneof(?KEYS)},
            {expire}]).
 
 run([], _Ix, S, M, _Pids, Ok) ->
@@ -84,6 +86,16 @@ step({down_noconn, L}, Ix, S0, M0, Pids) ->
     %% The lease and its claims must survive a netsplit blip.
     {_, S1} = apply_cmd({down, maps:get(L, Pids), noconnection}, Ix, S0),
     {S1, M0};
+step({leave, L, K}, Ix, S0, M0, _Pids) ->
+    %% `ok` means the machine removed a waiter's bid (never the holder's
+    %% claim); `not_queued` is a no-op in both machine and model.
+    case apply_cmd({leave_queue, K, L}, Ix, S0) of
+        {ok, S1} ->
+            Cur = maps:get(K, maps:get(claims, M0), []),
+            {S1, set_claims(K, [X || X <- Cur, X =/= L], M0)};
+        {{error, not_queued}, S1} ->
+            {S1, M0}
+    end;
 step({expire}, Ix, S0, M0, _Pids) ->
     {_, S1} = apply_cmd({timeout, expire}, Ix, S0),
     Expired = [L || {L, D} <- maps:to_list(maps:get(live, M0)), D =< Ix],

@@ -45,6 +45,8 @@ command_gen() ->
            {acquire, Field, Field, Field, Field, oneof([wait, nowait, Field]),
             Field},
            {release, Field, Field},
+           {transfer, Field, Field, Field},
+           {leave_queue, Field, Field},
            {watch, Field, Field},
            {unwatch, Field},
            {timeout, expire},

@@ -116,10 +116,10 @@ transfer_routes_to_the_keys_election(_Config) ->
 duplicate_keys_start_one_election(_Config) ->
     {ok, Svc} = start_service([k1, k1], #{}),
     {_, Pid} = await_started(k1),
-    receive {started, k1, _, Other} -> ct:fail({second_election, Other})
-    after 1000 -> ok
-    end,
-    ?assert(is_pid(Pid)),
+    %% The tracked election is the one that won: a duplicate would leave an
+    %% untracked winner and record the losing standby's pid here.
+    Elections = gen_server:call(Svc, elections),
+    ?assertEqual(#{k1 => Pid}, Elections),
     ok = portunus_service:stop(Svc).
 
 start_service(Keys, Opts) ->

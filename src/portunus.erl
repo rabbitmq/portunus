@@ -37,6 +37,7 @@ target any member's replica (`reset_server/2`).
 -export([acquire/4, acquire/5,
          acquire_or_join_succession_queue/4,
          acquire_or_join_succession_queue/5,
+         leave_succession_queue/3,
          release/3,
          transfer/4,
          contenders/2,
@@ -105,6 +106,7 @@ target any member's replica (`reset_server/2`).
 -type acquire_error() :: {held_by, owner()} | lease_expired | no_quorum.
 -type release_error() :: not_owner | not_held | no_quorum.
 -type transfer_error() :: not_owner | {no_contender, owner()} | no_quorum.
+-type leave_queue_error() :: not_queued | no_quorum.
 
 %% The result shape of every command that carries no value.
 -type ok_or_error(E) :: ok | {error, E}.
@@ -120,7 +122,8 @@ target any member's replica (`reset_server/2`).
 -export_type([name/0, system/0, lock_key/0, lease_id/0, token/0, owner/0,
               ttl/0, server_id/0, owner_info/0, succession_opts/0, watch_ref/0,
               grant_opts/0, env/0, status/0, lease_error/0, acquire_error/0,
-              release_error/0, transfer_error/0, ok_or_error/1, option/1,
+              release_error/0, transfer_error/0, leave_queue_error/0,
+              ok_or_error/1, option/1,
               handle/0]).
 
 %%
@@ -152,7 +155,7 @@ start_system(System, DataDir) ->
 %% Always go through `ra_system:start/1`: it re-creates the system, and
 %% recovers its servers from disk, whenever the `ra` application has been
 %% restarted. Guarding on `ra_system:fetch/1` instead would skip that, because
-%% its config lives in a persistent_term that outlives the system's processes,
+%% its config lives in a `persistent_term` that outlives the system's processes,
 %% so a restarted system looks present while its ETS tables are gone.
 %% `already_present` is a child spec left by a torn-down system: drop it and
 %% start again.
@@ -329,7 +332,7 @@ join_or_form(System, Name, Members) when is_list(Members), Members =/= [] ->
                     %% `restart_server` recovers the replica but, unlike
                     %% `start_cluster`, does not trigger an election. A recovered
                     %% single-member cluster has no peer to elect it, so it would
-                    %% sit leaderless after a full node restart. Nudge it. A
+                    %% sit leaderless after a full node restart. A
                     %% multi-member cluster re-elects among its peers and must not
                     %% be forced, so this is scoped to the sole-member case.
                     maybe_trigger_sole_member_election(Name, Members),
@@ -385,7 +388,10 @@ machine(Name) ->
                                  tick_interval_ms => Tick,
                                  snapshot_interval => SnapInterval}}.
 
--doc "Add a node as a member (auto-add is safe).".
+-doc """
+Add a node as a member. Adding automatically, e.g. from a boot
+sequence, is safe; removal is never automatic (see `remove_member/2`).
+""".
 -spec add_member(name(), node()) -> ok_or_error(term()).
 add_member(Name, Node) ->
     case ra:add_member(leader_or_local(Name), {Name, Node}) of
@@ -591,6 +597,18 @@ succession_score(Name, Key, #{affinity := Spec}) ->
     end;
 succession_score(_Name, _Key, _Opts) ->
     0.
+
+-doc """
+Withdraw the lease's succession bid on `LockKey`: the opposite of joining
+the queue with `acquire_or_join_succession_queue/4,5`, for a contender that
+no longer wants the key. The current holder is untouched, and the lease's
+other keys and bids are unaffected. A lease with no bid on the key returns
+`{error, not_queued}`; a holder releases with `release/3` instead.
+""".
+-spec leave_succession_queue(name(), lock_key(), lease_id()) ->
+    ok_or_error(leave_queue_error()).
+leave_succession_queue(Name, LockKey, LeaseId) ->
+    cmd(Name, {leave_queue, LockKey, LeaseId}).
 
 -doc "Release a held lock. Token-fenced: a stale token cannot release a re-granted lock.".
 -spec release(name(), lock_key(), token()) -> ok_or_error(release_error()).

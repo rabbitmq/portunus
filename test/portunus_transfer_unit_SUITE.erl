@@ -60,20 +60,20 @@ tokens_monotonic_across_transfer_and_release(_Config) ->
     {ok, S1, _} = at({transfer, k, Tok1, o2}, 10, 0, S0),
     {ok, #{owner := o2, token := Tok2}} = portunus_machine:query_owner(k, S1),
     ?assert(Tok2 > Tok1),
-    {{queued, 1}, S2, _} = at({acquire, l1, k, o1, undefined, wait}, 11, 0, S1),
+    {{queued, 1}, S2, _} = at({acquire, lease1, k, o1, undefined, wait}, 11, 0, S1),
     {ok, S3, _} = at({release, k, Tok2}, 12, 0, S2),
     {ok, #{owner := o1, token := Tok3}} = portunus_machine:query_owner(k, S3),
     ?assert(Tok3 > Tok2).
 
 %% Helpers
 
-%% One holder (o1, lease l1) of key k and one live waiter (o2, lease l2).
+%% Holder o1 (under lease1) of key k, and one live waiter o2 (under lease2).
 held_with_waiter() ->
     S0 = portunus_machine:init(#{cluster => test}),
-    {{ok, l1}, S1, _} = at({grant_lease, l1, 100000, o1, dummy_pid()}, 1, 0, S0),
-    {{ok, Tok}, S2, _} = at({acquire, l1, k, o1, undefined, nowait}, 2, 0, S1),
-    {{ok, l2}, S3, _} = at({grant_lease, l2, 100000, o2, dummy_pid()}, 3, 0, S2),
-    {{queued, 1}, S4, _} = at({acquire, l2, k, o2, undefined, wait}, 4, 0, S3),
+    {{ok, lease1}, S1, _} = at({grant_lease, lease1, 100000, o1, dummy_pid()}, 1, 0, S0),
+    {{ok, Tok}, S2, _} = at({acquire, lease1, k, o1, undefined, nowait}, 2, 0, S1),
+    {{ok, lease2}, S3, _} = at({grant_lease, lease2, 100000, o2, dummy_pid()}, 3, 0, S2),
+    {{queued, 1}, S4, _} = at({acquire, lease2, k, o2, undefined, wait}, 4, 0, S3),
     {Tok, S4}.
 
 at(Cmd, Ix, Now, State) ->

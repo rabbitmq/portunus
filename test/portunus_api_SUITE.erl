@@ -8,8 +8,9 @@
 -module(portunus_api_SUITE).
 
 %% The finalized public API: `acquire/4` tries once and never
-%% queues, `acquire_or_join_succession_queue` queues, `owner/2` reports a remaining
-%% remaining_ms, a missing renew is lease_expired, and a watch ref round-trips.
+%% queues, `acquire_or_join_succession_queue` queues, `owner/2` reports a
+%% `remaining_ms`, a missing renew is `lease_expired`, and a watch ref
+%% round-trips.
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
