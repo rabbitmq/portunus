@@ -37,6 +37,7 @@ target any member's replica (`reset_server/2`).
 -export([acquire/4, acquire/5,
          acquire_or_join_succession_queue/4,
          acquire_or_join_succession_queue/5,
+         acquire_with_timeout/5, acquire_with_timeout/6,
          leave_succession_queue/3,
          release/3,
          transfer/4,
@@ -51,6 +52,12 @@ target any member's replica (`reset_server/2`).
 
 %% Conveniences.
 -export([lock/3, unlock/1, with_lock/4]).
+
+-ifdef(TEST).
+%% The timed-out-bid settlement is race-reached in production; exported so
+%% both of its outcomes are testable deterministically.
+-export([settle_timed_out_bid/3]).
+-endif.
 
 -include("portunus.hrl").
 
@@ -107,6 +114,7 @@ target any member's replica (`reset_server/2`).
 -type release_error() :: not_owner | not_held | no_quorum.
 -type transfer_error() :: not_owner | {no_contender, owner()} | no_quorum.
 -type leave_queue_error() :: not_queued | no_quorum.
+-type acquisition_timeout_error() :: timeout | acquire_error().
 
 %% The result shape of every command that carries no value.
 -type ok_or_error(E) :: ok | {error, E}.
@@ -123,7 +131,7 @@ target any member's replica (`reset_server/2`).
               ttl/0, server_id/0, owner_info/0, succession_opts/0, watch_ref/0,
               grant_opts/0, env/0, status/0, lease_error/0, acquire_error/0,
               release_error/0, transfer_error/0, leave_queue_error/0,
-              ok_or_error/1, option/1,
+              acquisition_timeout_error/0, ok_or_error/1, option/1,
               handle/0]).
 
 %%
@@ -597,6 +605,76 @@ succession_score(Name, Key, #{affinity := Spec}) ->
     end;
 succession_score(_Name, _Key, _Opts) ->
     0.
+
+-doc """
+Acquire `LockKey`, waiting up to `TimeoutMs` for the current owner to
+release, be revoked, or expire.
+
+Must be called by the lease holder process, which receives the
+`{portunus, granted, ...}` message.
+
+On timeout the bid is withdrawn, so the caller is never granted a key it
+gave up on. A grant that lands at the same instant is detected and the
+key is returned.
+
+`{error, no_quorum}` on the timeout path means the withdrawal is
+unconfirmed: the bid may still be queued, so retry
+`leave_succession_queue/3` or revoke the lease.
+""".
+-spec acquire_with_timeout(name(), lock_key(), lease_id(), owner(),
+                    non_neg_integer()) ->
+    {ok, token()} | {error, acquisition_timeout_error()}.
+acquire_with_timeout(Name, LockKey, LeaseId, Owner, TimeoutMs) ->
+    acquire_with_timeout(Name, LockKey, LeaseId, Owner, TimeoutMs, #{}).
+
+-doc """
+Like `acquire_with_timeout/5`, with the options of
+`acquire_or_join_succession_queue/5`.
+""".
+-spec acquire_with_timeout(name(), lock_key(), lease_id(), owner(),
+                    non_neg_integer(), succession_opts()) ->
+    {ok, token()} | {error, acquisition_timeout_error()}.
+acquire_with_timeout(Name, LockKey, LeaseId, Owner, TimeoutMs, Opts)
+  when is_integer(TimeoutMs), TimeoutMs >= 0 ->
+    case acquire_or_join_succession_queue(Name, LockKey, LeaseId, Owner,
+                                          Opts) of
+        {ok, Token} ->
+            {ok, Token};
+        {queued, _Depth} ->
+            receive
+                {portunus, granted, LockKey, Token, LeaseId} ->
+                    {ok, Token}
+            after TimeoutMs ->
+                case leave_succession_queue(Name, LockKey, LeaseId) of
+                    ok ->
+                        %% A committed withdrawal proves the bid was never
+                        %% promoted, so no grant message is in flight.
+                        {error, timeout};
+                    {error, not_queued} ->
+                        settle_timed_out_bid(Name, LockKey, LeaseId);
+                    {error, no_quorum} = Err ->
+                        Err
+                end
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% The bid was gone by the time the withdrawal committed: either the grant
+%% won the race or the lease died and the queue dropped it. The grant's
+%% message may still be in flight, so only a linearizable read can tell;
+%% a late-arriving grant message for an owned key is then harmless.
+settle_timed_out_bid(Name, LockKey, LeaseId) ->
+    case owner(Name, LockKey) of
+        {ok, #{lease := LeaseId, token := Token}} ->
+            {ok, Token};
+        {ok, #{}} ->
+            {error, timeout};
+        {error, not_held} ->
+            {error, timeout};
+        {error, no_quorum} = Err ->
+            Err
+    end.
 
 -doc """
 Withdraw the lease's succession bid on `LockKey`: the opposite of joining

@@ -147,6 +147,17 @@ case portunus:acquire_or_join_succession_queue(my_locks, Key, Lease, self()) of
 end.
 ```
 
+`acquire_with_timeout/5` bounds the wait: it queues, waits up to a deadline for
+the grant, and on timeout withdraws the bid, settling the race where the
+grant landed at the same instant:
+
+```erlang
+case portunus:acquire_with_timeout(my_locks, Key, Lease, self(), 5000) of
+    {ok, Token} -> owned(Token);
+    {error, timeout} -> busy
+end.
+```
+
 ## Watches
 
 `watch/2` subscribes the calling process to a key's acquire and release
