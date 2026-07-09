@@ -1,11 +1,13 @@
 # Portunus
 
+[![Test](https://github.com/rabbitmq/portunus/actions/workflows/tests.yml/badge.svg)](https://github.com/rabbitmq/portunus/actions/workflows/tests.yml)
+
 `portunus` is a small, generic lock server for the Erlang ecosystem, built on
 [Ra](https://github.com/rabbitmq/ra), RabbitMQ's Raft implementation.
 It provides cluster-wide mutual exclusion, TTL leases with renewal,
 leader election, and a succession queue with pluggable placement
 affinity. It is a CP (consistency over availability) service in the
-tradition of etcd and ZooKeeper, but embedded as a library rather than
+style of etcd and ZooKeeper, but embedded as a library rather than
 run as an external service.
 
 Portunus implements a Ra state machine. It does not depend on or use
@@ -13,26 +15,21 @@ Khepri. It is named after the Roman god of keys, doors, and gates.
 
 ## Project Maturity
 
-This project is very young, therefore breaking changes are not only
-possible but likely.
+This project is young: breaking changes are likely.
 
 ## Why
 
-Because the standard library's `global` module has its limits (no
-clear partition handling semantics, no fencing token support,
-major changes and rapid iteration are out of the question due to its maturity),
-and hand-rolling a distributed locking library (compared to to ZooKeeper, `etcd`,
-Consul in terms of core features) is hard and error-prone.
+The standard library's `global` module has limits: no clear partition
+handling semantics, no fencing tokens, and its maturity rules out major
+changes or rapid iteration. Hand-rolling a distributed locking library
+comparable in core features to ZooKeeper, `etcd`, or Consul is hard and
+error-prone.
 
-At the same time, the field of Raft-based distributed locking
-services is mature and well understood. And Team RabbitMQ
-happens to have a mature and solid Raft implementation.
-
+At the same time, the field of Raft-based distributed locking services
+is mature and well understood, and Team RabbitMQ already maintains a
+Raft implementation: Ra.
 
 ## Core Ideas
-
-`portunus` is an embedded distributed lock server with the following
-key concepts and design ideas:
 
  * Safety and liveness are separated. At most one owner per key, and
    monotonically increasing fencing tokens, are guaranteed by Raft,
@@ -53,21 +50,33 @@ key concepts and design ideas:
    `portunus_affinity` module) biases which node wins. Affinity is a
    hint, never a correctness requirement
 
-## Supported Erlang/OTP Versions
+## Requirements
 
 Portunus requires Erlang/OTP 27 and should work equally well on
-Erlang 28 and 29, including mixed-version clusters during upgrades.
+Erlang/OTP 28 and 29, including mixed-version clusters during upgrades.
+It targets `ra` `3.1.8` or later.
 
-## Supported `ra` Versions
+## Dependency
 
-Portunus targets `ra` `3.1.8` or later versions.
+There is no Hex release yet; depend on the git repository. With
+`rebar3`:
 
+```erlang
+{deps, [{portunus, {git, "https://github.com/rabbitmq/portunus", {branch, "main"}}}]}.
+```
+
+With `erlang.mk`:
+
+```makefile
+DEPS = portunus
+dep_portunus = git https://github.com/rabbitmq/portunus main
+```
 
 ## Getting Started
 
-Portunus requires Erlang/OTP 27 or later. Every node starts a Ra system,
-which keeps its Raft state under the given directory, and the nodes then
-form a named cluster:
+Portunus requires modern Erlang/OTP (see Requirements above). Every
+node starts a Ra system, which keeps its Raft state under the given
+directory, and the nodes then form a named cluster:
 
 ```erlang
 %% on every node, once
@@ -187,10 +196,9 @@ on top of the lock and lease core.
 ## Leader Election
 
 `portunus_election` keeps exactly one instance of a component running
-in the cluster. A participant runs on every node; the elected one has
-`elected/1` called (with the fencing token in its context), and
-`stepped_down/1` when the lease is lost, at which point ownership moves
-to another node:
+in the cluster. A participant runs on every node; the elected one runs
+`elected/1` (its context carries the fencing token) and `stepped_down/1`
+when the lease is lost, at which point ownership moves to another node:
 
 ```erlang
 -module(my_scheduler).
@@ -206,9 +214,18 @@ stepped_down(Pid) ->
 ```
 
 ```erlang
-{ok, _Pid} = portunus_election:start_link(my_locks, scheduler_key,
-                                          my_scheduler, [],
-                                          #{ttl_ms => 30000}).
+{ok, Pid} = portunus_election:start_link(my_locks, scheduler_key,
+                                         my_scheduler, [],
+                                         #{ttl_ms => 30000}).
+```
+
+The owner can hand the key to a chosen node with `transfer_to/2`: it
+stops the local work, performs the token-fenced transfer, and
+re-contends as a standby. A target that is not a ready contender
+(`contenders/2` lists them) is refused and the owner keeps running:
+
+```erlang
+ok = portunus_election:transfer_to(Pid, 'b@host').
 ```
 
 ## A Managed Set of Keys
@@ -260,8 +277,8 @@ init([]) ->
              restart => permanent}]}}.
 ```
 
-Child specs may carry the extended `{permanent, Delay}` /
-`{transient, Delay}` restart type (as `supervisor2` accepts), rewritten
+Child specs may carry the extended `{permanent, Delay}` and
+`{transient, Delay}` restart types (as `supervisor2` accepts), rewritten
 by `portunus_delayed_restart` into a rate-limited standard spec.
 
 ## The Dynamic Registry
@@ -286,6 +303,19 @@ owner moves the child to another node, and the key is gone cluster-wide
 once every node that added it removes it. `owned_keys/1` and
 `which_children/1` report what this node currently runs.
 
+`transfer/3` hands a key this node owns to a named node in one
+token-fenced machine transition:
+
+```erlang
+ok = portunus_registry:transfer(Reg, shovel_a, 'b@host').
+```
+
+A target that is not a ready contender is refused with
+`{error, {no_contender, Node}}` and the current owner keeps running, so
+a rebalancer can retry without ever leaving the key ownerless or run in
+two places. `portunus_supervisor:transfer/3` and `portunus:transfer/4`
+(by opaque owner term) are the same operation at the other layers.
+
 ## Placement Affinity
 
 Elections, services, and registries accept `#{affinity => Spec}` to
@@ -303,6 +333,41 @@ fun:
 %% the least-loaded node wins, by a locally read metric
 #{affinity => {metric, fun() -> spare_capacity() end}}
 ```
+
+## Node Restarts and Membership Changes
+
+Membership is managed with `add_member/2`, `remove_member/2`, and
+`members/1`:
+
+```erlang
+ok = portunus:add_member(my_locks, 'new@host'),
+ok = portunus:remove_member(my_locks, 'departed@host'),
+{ok, Members, Leader} = portunus:members(my_locks).
+```
+
+A few recommendations for applications that manage the cluster
+lifecycle themselves.
+
+Run `portunus` on every node of the host system (for example, on every
+node of a RabbitMQ cluster). A node without a running member can never
+own a key, and no cluster can form if such a node is chosen as the seed.
+
+Compute the member list the same way on every node, from configuration
+or from the host system's own membership, never from which nodes are
+reachable: nodes with different views of "who is up" can each form
+their own cluster on first boot.
+
+On a restart, let `join_or_form/3` recover the node's on-disk state.
+`reset_and_join_cluster/3` wipes it and is only for a node that joined
+the wrong cluster.
+
+Only remove a member that is gone for good. A disconnected node does
+not block the surviving majority, and lease expiry already moves its
+keys, so a disconnect needs no membership change.
+
+Re-check membership periodically rather than from events alone: a
+periodic pass retries a missed join, removes members that left quietly,
+and heals a first-boot split.
 
 ## Layout
 
