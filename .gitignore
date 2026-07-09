@@ -31,3 +31,5 @@ config
 _apalache-out/*
 
 /.vscode/
+/.idea/
+/.zed/
