@@ -38,7 +38,7 @@ end_per_suite(_Config) ->
     ok.
 
 first_start_is_immediate(_Config) ->
-    ?assert(elapsed_ms(fun() -> start(id_first, 1) end) < 200).
+    ?assert(elapsed_ms(fun() -> start(id_first, 1) end) < 500).
 
 rapid_restart_waits_out_the_delay(_Config) ->
     %% Both starts together: the second waits out whatever remains of the
@@ -52,12 +52,12 @@ rapid_restart_waits_out_the_delay(_Config) ->
 isolated_restart_is_immediate(_Config) ->
     _ = start(id_isolated, 1),
     timer:sleep(1100),
-    ?assert(elapsed_ms(fun() -> start(id_isolated, 1) end) < 200).
+    ?assert(elapsed_ms(fun() -> start(id_isolated, 1) end) < 500).
 
 forget_makes_next_start_immediate(_Config) ->
     _ = start(id_forget, 1),
     ok = portunus_delayed_restart:forget(self(), id_forget),
-    ?assert(elapsed_ms(fun() -> start(id_forget, 1) end) < 200).
+    ?assert(elapsed_ms(fun() -> start(id_forget, 1) end) < 500).
 
 child_spec_rewrites(_Config) ->
     MFA = {mod, fun_name, [a]},

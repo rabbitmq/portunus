@@ -5,7 +5,7 @@
 %% Copyright (c) 2026 Team RabbitMQ <teamrabbitmq@gmail.com>. All Rights Reserved.
 %%
 
--module(portunus_transfer_api_SUITE).
+-module(portunus_transfer_integration_SUITE).
 
 %% `portunus:transfer/4` through a live cluster: the machine unit suite
 %% covers the token fence in isolation; here a stale token is refused
@@ -20,7 +20,7 @@
          transfer_counters_are_published/1]).
 
 -define(SYS, portunus).
--define(NAME, portunus_transfer_api_test).
+-define(NAME, portunus_transfer_integration_test).
 
 all() ->
     [stale_token_is_refused_after_handoff,

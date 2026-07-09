@@ -57,8 +57,7 @@ crash_promotes_standby(_Config) ->
     {ok, E1} = start(Key),
     T1 = receive {elected, Key, Tok, E1} -> Tok after 30000 -> ct:fail(no_leader) end,
     {ok, E2} = start(Key),
-    %% Let E2 establish its lease and join the queue behind E1.
-    timer:sleep(1000),
+    ok = await_contender(Key),
     true = exit(E1, kill),
     receive
         {elected, Key, T2, E2} -> ?assert(T2 > T1)
@@ -111,7 +110,7 @@ transfer_to_non_owner_is_not_owner(_Config) ->
     {ok, E1} = start(Key),
     receive {elected, Key, _T, E1} -> ok after 30000 -> ct:fail(no_leader) end,
     {ok, E2} = start(Key),
-    timer:sleep(1000),
+    ok = await_contender(Key),
     false = portunus_election:is_leader(E2),
     {error, not_owner} = portunus_election:transfer_to(E2, node()),
     true = exit(E1, kill),
@@ -127,6 +126,18 @@ start(Key) ->
 start(Key, Ttl) ->
     portunus_election:start_link(?NAME, Key, portunus_demo_election,
                                  self(), #{ttl_ms => Ttl}).
+
+%% E2 is a ready contender once its owner term appears in the succession
+%% queue; a fixed sleep can miss that under load and silently test the
+%% free-key acquire path instead.
+await_contender(Key) ->
+    portunus_test_helpers:await_condition(
+      fun() ->
+              case portunus:contenders(?NAME, Key) of
+                  {ok, Owners} -> lists:member(node(), Owners);
+                  _ -> false
+              end
+      end).
 
 %% The election's links are the test process and its keepalive; the latter is
 %% the one to kill to simulate lease loss.

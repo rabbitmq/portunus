@@ -164,7 +164,9 @@ do_apply(Meta, {grant_lease, ProposedId, TtlMs, Owner, Pid}, State0)
     case maps:find(LeaseId, State0#?MODULE.leases) of
         {ok, #lease{owner = Owner} = L} ->
             %% Idempotent re-grant by the same owner: refresh the deadline,
-            %% re-arming the monitor lost to a `noconnection`.
+            %% re-arming the monitor lost to a `noconnection`. The command's
+            %% pid is ignored: through the public API the owner is the pid,
+            %% so a same-owner re-grant always carries the same pid.
             L1 = L#lease{deadline = Now + TtlMs, ttl_ms = TtlMs},
             {State1, Effs} =
                 ensure_monitor(L#lease.pid,
@@ -220,7 +222,7 @@ do_apply(Meta, {acquire, LeaseId, LockKey, Owner, Context, Wait, Score}, State0)
     do_acquire(Meta, LeaseId, LockKey, Owner, Context, Wait, Score, State0);
 do_apply(Meta, {release, LockKey, Token}, State0) ->
     %% Token-fenced: a stale token (the lock was reclaimed and re-granted)
-    %% returns not_owner and does not release the current owner.
+    %% returns `not_owner` and does not release the current owner.
     case maps:find(LockKey, State0#?MODULE.locks) of
         {ok, LeaseId} ->
             Lease = maps:get(LeaseId, State0#?MODULE.leases),
@@ -236,8 +238,8 @@ do_apply(Meta, {release, LockKey, Token}, State0) ->
             {State0, {error, not_held}}
     end;
 %% Token-fenced like release: only the current holder transfers, and only to a
-%% named contender. A free key or a stale token returns not_owner, a target
-%% equal to the holder returns ok, and a target with no live contender is
+%% named contender. A free key or a stale token returns `not_owner`, a target
+%% equal to the holder returns `ok`, and a target with no live contender is
 %% refused.
 do_apply(Meta, {transfer, LockKey, Token, TargetOwner}, State0) ->
     case maps:find(LockKey, State0#?MODULE.locks) of
@@ -271,7 +273,7 @@ do_apply(_Meta, {unwatch, Ref}, State0) ->
         maps:fold(
           fun(K, Ws, {Acc, Drop}) ->
                   Removed = [P || P := R <- Ws, R =:= Ref],
-                  case maps:filter(fun(_P, R) -> R =/= Ref end, Ws) of
+                  case #{P => R || P := R <- Ws, R =/= Ref} of
                       Kept when map_size(Kept) =:= 0 -> {Acc, Removed ++ Drop};
                       Kept -> {maps:put(K, Kept, Acc), Removed ++ Drop}
                   end
@@ -290,7 +292,7 @@ do_apply(Meta, {timeout, expire}, State0) ->
     Expired = lists:sort(
                 [LeaseId || {LeaseId, #lease{deadline = D}} <-
                                 maps:to_list(State0#?MODULE.leases), D =< Now]),
-    %% Expiry is the one loss nobody initiated, so the deposed holder is
+    %% No client initiated this loss, so the deposed holder is
     %% told directly instead of waiting out a renew interval. `local`
     %% delivers through the member on the holder's node, which may be the
     %% only path when the holder expired because it cannot reach the leader.
@@ -310,7 +312,7 @@ do_apply(Meta, {timeout, expire}, State0) ->
 %% Unreachable, not dead: the lease still decides. The cross-node monitor
 %% auto-cleared with the connection, so drop the stale monitored entry; a later
 %% grant, renew or watch re-arms it. A watch-only pid has no renewal path, so
-%% its monitor comes back only at the next leader change — acceptable for
+%% its monitor comes back only at the next leader change, acceptable for
 %% best-effort watches.
 do_apply(_Meta, {down, Pid, noconnection}, State0) ->
     {State0#?MODULE{monitored = maps:remove(Pid, State0#?MODULE.monitored)}, ok};
@@ -565,11 +567,10 @@ release_key(Meta, LockKey, LeaseId, Revoking, State0) ->
 
 %% Grant the freed lock to the highest-scoring live succession candidate
 %% (ties break to the earliest arrival). Skipped: candidates whose lease is
-%% gone, and candidates
-%% whose lease is in `Revoking` — being revoked by this same command. Such a
-%% promotion would be revoked again a fold step later, and its re-promotion
-%% would mint a second token for the key at the same Raft index, breaking
-%% per-key token monotonicity.
+%% gone, and candidates whose lease is in `Revoking` (being revoked by this
+%% same command). Such a promotion would be revoked again a fold step later,
+%% and its re-promotion would mint a second token for the key at the same
+%% Raft index, breaking per-key token monotonicity.
 promote_waiter(Meta, LockKey, Revoking, State0, Effs) ->
     Ws0 = maps:get(LockKey, State0#?MODULE.leader_succession_queue, []),
     Live = [W || W <- Ws0,
@@ -657,8 +658,7 @@ set_waiters(LockKey, Ws, State) ->
     State#?MODULE{leader_succession_queue = Q}.
 
 %% The lease id lets a succession candidate tell a fresh grant from one
-%% minted for an
-%% earlier, since-revoked attempt that is still in flight.
+%% minted for an earlier, since-revoked attempt that is still in flight.
 grant_msg(undefined, _LockKey, _Token, _LeaseId) ->
     [];
 grant_msg(Pid, LockKey, Token, LeaseId) ->
@@ -701,8 +701,7 @@ release_keys(Meta, LockKeys, LeaseId, Revoking, State0) ->
                     end, {State0, []}, LockKeys),
     {State, lists:append(lists:reverse(Groups))}.
 
-%% Revoke a whole lease: release every key it holds (promoting
-%% candidates),
+%% Revoke a whole lease: release every key it holds (promoting candidates),
 %% drop its pid index entry, and remove the lease.
 revoke_lease(Meta, LeaseId, Revoking, State0) ->
     case maps:find(LeaseId, State0#?MODULE.leases) of
@@ -752,11 +751,12 @@ drop_watcher(Pid, State) ->
                  end, #{}, State#?MODULE.watchers),
     State#?MODULE{watchers = Watchers}.
 
+%% Sorted so the effect order is a pure function of replicated state, like
+%% every other effect-emitting fold in this module.
 notify_watchers(LockKey, Event, State) ->
     Ws = maps:get(LockKey, State#?MODULE.watchers, #{}),
-    maps:fold(fun(Pid, Ref, Acc) ->
-                      [{send_msg, Pid, {portunus, watch, Ref, Event}} | Acc]
-              end, [], Ws).
+    [{send_msg, Pid, {portunus, watch, maps:get(Pid, Ws), Event}}
+     || Pid <- lists:sort(maps:keys(Ws))].
 
 known_pids(State) ->
     LeasePids = maps:keys(State#?MODULE.lease_pids),

@@ -94,11 +94,13 @@ init({Name, Mod, Args, Opts}) ->
     State0 = #state{name = Name, group = maps:get(group, Opts, Mod), mod = Mod,
                     args = Args, ttl_ms = maps:get(ttl_ms, Opts, 60000),
                     affinity = maps:get(affinity, Opts, default)},
+    %% `usort`: a duplicate key from the callback would start a second,
+    %% untracked election for the same lock key.
     Elections = lists:foldl(
                   fun(Key, Acc) ->
                           {ok, Pid} = start_election(Key, State0),
                           maps:put(Key, Pid, Acc)
-                  end, #{}, Mod:keys(Args)),
+                  end, #{}, lists:usort(Mod:keys(Args))),
     {ok, State0#state{elections = Elections}}.
 
 handle_call(elections, _From, State) ->

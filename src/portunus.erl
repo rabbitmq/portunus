@@ -447,7 +447,9 @@ holder-linked renewer keeps it alive for as long as the calling process
 lives; the lease (and any locks held under it) ends when the caller dies
 or revokes. The returned id is used exactly like any other. A
 `proposed_id` makes the grant idempotent under retry; without one the id
-is auto-assigned.
+is auto-assigned. Auto-assigned ids are integers (Raft indices), so an
+integer `proposed_id` can collide with them and draw a spurious
+`id_in_use`; propose a tuple or any other non-integer term.
 
 A holder that revokes an auto-renewed lease receives one final
 `{portunus, lease_lost, LeaseId}` when the renewer discovers the

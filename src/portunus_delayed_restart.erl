@@ -20,8 +20,8 @@ rate-limited to one attempt per `Delay`: an isolated crash restarts at
 once, and only a restart within `Delay` of the previous attempt waits out
 the remainder. This is not exactly `supervisor2`, which restarts
 immediately until MaxR/MaxT is exceeded and only then delays on a timer;
-the practical property migrated specs rely on — a one-off crash recovers
-immediately while a crash loop is dampened — is the same. The wait runs in
+the practical property migrated specs rely on (a one-off crash recovers
+immediately while a crash loop is dampened) is the same. The wait runs in
 the local supervisor's own process (a supervisor runs a child's start
 synchronously), so a crash-looping child holds up the others under that
 supervisor for up to `Delay`; the running pid is always the real child, so

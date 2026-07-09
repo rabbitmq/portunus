@@ -58,12 +58,15 @@ prop_failed_transfer_changes_nothing() ->
                 end
             end).
 
-%% Across a random chain of transfers, each drawn with a valid, stale, or
-%% self-transfer target and token: the key is owned at every step by the
-%% original holder or an enqueued waiter (never free, never a third party),
-%% and its token never decreases, increasing strictly whenever ownership
-%% moves. This is the Quint model's `targetedHandover` sampled against the
-%% real `apply/3` over chains rather than one step.
+%% Across a random chain of transfers, each drawn with a valid or stale
+%% token and a random (possibly self) target: the key is owned at every
+%% step by the original holder or an enqueued waiter (never free, never a
+%% third party), and its token never decreases, increasing strictly
+%% whenever ownership moves. A stale move replays the token the previous
+%% owner held, the classic fencing scenario; before the first handoff it
+%% falls back to a never-minted future token. This is the Quint model's
+%% `targetedHandover` sampled against the real `apply/3` over chains
+%% rather than one step.
 prop_transfer_chain_stays_safe() ->
     ?FORALL({Waiters, Moves},
             {non_empty(list(waiter())),
@@ -73,15 +76,16 @@ prop_transfer_chain_stays_safe() ->
                 Known = [o0 | [{w, I} || I <- lists:seq(0, length(Waiters) - 1)]],
                 %% Indices count up from below the snapshot interval (see the
                 %% comment in the other property).
-                {_, _, _, Ok} =
+                {_, _, _, _, Ok} =
                     lists:foldl(
-                      fun(_, {_, _, _, false} = Acc) ->
+                      fun(_, {_, _, _, _, false} = Acc) ->
                               Acc;
-                         ({TargetIx, TokChoice}, {Ix, Tok, S, true}) ->
+                         ({TargetIx, TokChoice}, {Ix, Tok, Prev, S, true}) ->
                               Cmd = {transfer, k,
-                                     case TokChoice of
-                                         current -> Tok;
-                                         stale -> Tok + 1
+                                     case {TokChoice, Prev} of
+                                         {current, _} -> Tok;
+                                         {stale, none} -> Tok + 1;
+                                         {stale, P} -> P
                                      end, {w, TargetIx}},
                               {_, S1, _} = step(Cmd, Ix, S),
                               {ok, #{owner := Owner, token := Tok1}} =
@@ -89,8 +93,12 @@ prop_transfer_chain_stays_safe() ->
                               Safe = lists:member(Owner, Known)
                                   andalso Tok1 >= Tok
                                   andalso (Tok1 > Tok orelse S1 =:= S),
-                              {Ix + 1, Tok1, S1, Safe}
-                      end, {2000, THolder, S0, true}, Moves),
+                              Prev1 = case Tok1 > Tok of
+                                          true -> Tok;
+                                          false -> Prev
+                                      end,
+                              {Ix + 1, Tok1, Prev1, S1, Safe}
+                      end, {2000, THolder, none, S0, true}, Moves),
                 Ok
             end).
 

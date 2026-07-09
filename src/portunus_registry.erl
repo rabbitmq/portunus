@@ -24,7 +24,7 @@ No new replicated state: the registry holds only local election pids and
 a local supervisor. Restart is local and per-child, with one exception: a
 child that crash-loops past the local supervisor's intensity takes the
 registry down with `{local_sup_down, _}`, and the restarted registry is
-empty — the host re-adds its children, as it does after a node restart.
+empty: the host re-adds its children, as it does after a node restart.
 
 The registry's cleanup releases cluster-wide locks, so a child spec
 supervising it should give it a generous `shutdown` value.

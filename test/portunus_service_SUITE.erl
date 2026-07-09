@@ -21,7 +21,9 @@
 -export([starts_one_owner_per_key/1,
          stop_runs_the_stop_callback/1,
          group_isolates_services/1,
-         crashed_election_is_restarted/1]).
+         crashed_election_is_restarted/1,
+         transfer_routes_to_the_keys_election/1,
+         duplicate_keys_start_one_election/1]).
 -export([keys/1, start/3, stop/2]).
 
 -define(SYS, portunus).
@@ -30,7 +32,8 @@
 
 all() ->
     [starts_one_owner_per_key, stop_runs_the_stop_callback,
-     group_isolates_services, crashed_election_is_restarted].
+     group_isolates_services, crashed_election_is_restarted,
+     transfer_routes_to_the_keys_election, duplicate_keys_start_one_election].
 
 init_per_suite(Config) ->
     application:set_env(portunus, tick_interval_ms, 200),
@@ -95,6 +98,28 @@ crashed_election_is_restarted(_Config) ->
     %% runs a second time under a fresh election pid.
     {_, Election2} = await_started(k),
     ?assert(Election2 =/= Election1),
+    ok = portunus_service:stop(Svc).
+
+%% `transfer/3` looks the election up by the bare key (the lock key is the
+%% namespaced `{Group, Key}`): a self-transfer on the owned key is `ok`,
+%% an unknown key is `not_owner`, and the owner keeps running throughout.
+transfer_routes_to_the_keys_election(_Config) ->
+    {ok, Svc} = start_service([k1], #{}),
+    _ = await_started(k1),
+    ok = portunus_service:transfer(Svc, k1, node()),
+    {error, not_owner} = portunus_service:transfer(Svc, no_such_key, node()),
+    receive {stopped, k1} -> ct:fail(owner_stopped) after 200 -> ok end,
+    ok = portunus_service:stop(Svc).
+
+%% A duplicate key from `keys/1` starts one tracked election, not a second,
+%% untracked one that would win invisibly.
+duplicate_keys_start_one_election(_Config) ->
+    {ok, Svc} = start_service([k1, k1], #{}),
+    {_, Pid} = await_started(k1),
+    receive {started, k1, _, Other} -> ct:fail({second_election, Other})
+    after 1000 -> ok
+    end,
+    ?assert(is_pid(Pid)),
     ok = portunus_service:stop(Svc).
 
 start_service(Keys, Opts) ->

@@ -13,7 +13,7 @@ Gauges are published per node by the machine's `handle_aux/5` on each tick
 (`set_gauges/2`), so every member reports its own view, not the leader's.
 `is_leader` and `leader_changes_total` come from the machine's `state_enter/2`,
 which fires on every member. Counters are bumped via `incr/2` from the leader's
-apply effects — never inside `apply/3`, which runs on every replica and would
+apply effects, never inside `apply/3`, which runs on every replica and would
 N-fold over-count. The one exception is
 `failures_due_to_lack_of_online_quorum_total`, bumped on the client side when
 a command or query cannot be served because the Raft cluster has no online

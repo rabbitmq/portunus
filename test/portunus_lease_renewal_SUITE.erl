@@ -134,21 +134,10 @@ grant(keep_alive) ->
     {ok, _Renewer} = portunus:keep_alive(?NAME, Lease, ?TTL),
     {ok, Lease}.
 
-wait_leader(_Name, 0) ->
-    {error, no_leader};
+%% Thin wrappers over the shared helpers, so a timeout fails with a clear
+%% message instead of a badmatch on `{error, timeout}`.
 wait_leader(Name, N) ->
-    case ra_leaderboard:lookup_leader(Name) of
-        undefined -> timer:sleep(50), wait_leader(Name, N - 1);
-        _ -> ok
-    end.
+    portunus_test_helpers:await_leader(Name, N * 50).
 
 wait_until(Fun) ->
-    wait_until(Fun, 100).
-
-wait_until(_Fun, 0) ->
-    {error, timeout};
-wait_until(Fun, N) ->
-    case Fun() of
-        true -> ok;
-        _ -> timer:sleep(100), wait_until(Fun, N - 1)
-    end.
+    portunus_test_helpers:await_condition(Fun, 10000).

@@ -60,13 +60,14 @@ open(Name, Opts) when ?IS_RENEWABLE_TTL_OPT(Opts) ->
 
 -doc "Claim an exclusive key under the session; returns its fencing token.".
 -spec claim(session(), portunus:lock_key()) ->
-    {ok, portunus:token()} | {error, term()}.
+    {ok, portunus:token()} | {error, portunus:acquire_error()}.
 claim(Session, Key) ->
     %% `infinity`: the inner Ra command already bounds latency, so the outer
     %% call must not time out and crash the caller while the session is fine.
     gen_server:call(Session, {claim, Key}, infinity).
 
--spec release(session(), portunus:lock_key()) -> ok | {error, term()}.
+-spec release(session(), portunus:lock_key()) ->
+    ok | {error, portunus:release_error()}.
 release(Session, Key) ->
     gen_server:call(Session, {release, Key}, infinity).
 

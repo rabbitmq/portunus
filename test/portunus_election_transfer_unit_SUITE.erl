@@ -86,7 +86,7 @@ transfer_recontends_with_one_stepdown(_Config) ->
          end,
     ?assert(T3 > T1),
     receive {stepped_down, Key, E} -> ct:fail(second_stepdown) after 200 -> ok end,
-    true = exit(E, kill).
+    ok = portunus_election:stop(E).
 
 %% A `lease_lost` for the pre-transfer lease delivered after the transfer is
 %% dropped: the election has already reset, so no second `stepped_down` fires
@@ -103,14 +103,14 @@ stale_lease_lost_after_transfer_is_dropped(_Config) ->
     receive {stepped_down, Key, E} -> ct:fail(second_stepdown) after 500 -> ok end,
     ok = portunus:revoke_lease(?NAME, PeerLease),
     receive {elected, Key, _T2, E} -> ok after 30000 -> ct:fail(no_win_back) end,
-    true = exit(E, kill).
+    ok = portunus_election:stop(E).
 
 %% The transfer command times out without committing: the owner still holds
 %% the key, so the work stays stopped only until the reconciliation read confirms
 %% ownership and restores it on the unchanged token. Exactly one
 %% `stepped_down` and one restoring `elected` fire.
 uncommitted_no_quorum_restores_owner_on_same_token(_Config) ->
-    Key = {election, xfer_nq_uncommitted},
+    Key = {election, xfer_timeout_uncommitted},
     meck:new(portunus, [passthrough]),
     {ok, E} = start(Key),
     T1 = receive {elected, Key, Tok, E} -> Tok after 30000 -> ct:fail(no_leader) end,
@@ -134,7 +134,7 @@ uncommitted_no_quorum_restores_owner_on_same_token(_Config) ->
 %% it on two nodes with no correction). It re-contends instead, and the
 %% target stays the owner.
 committed_no_quorum_recontends_without_restart(_Config) ->
-    Key = {election, xfer_nq_committed},
+    Key = {election, xfer_timeout_committed},
     meck:new(portunus, [passthrough]),
     {ok, E} = start(Key),
     T1 = receive {elected, Key, Tok, E} -> Tok after 30000 -> ct:fail(no_leader) end,
