@@ -53,11 +53,9 @@ target any member's replica (`reset_server/2`).
 %% Conveniences.
 -export([lock/3, unlock/1, with_lock/4]).
 
--ifdef(TEST).
-%% The timed-out-bid settlement is race-reached in production; exported so
-%% both of its outcomes are testable deterministically.
+%% Exported (undocumented) so both settlement outcomes are testable directly:
+%% the race that reaches it in production cannot be timed deterministically.
 -export([settle_timed_out_bid/3]).
--endif.
 
 -include("portunus.hrl").
 
@@ -151,9 +149,14 @@ start_system(System, DataDir) ->
         %% initialises the counters and, through `portunus_sup`, owns the
         %% delayed-restart marker table.
         {ok, _} ?= application:ensure_all_started(portunus),
+        %% `server_recovery_strategy => registered` restarts this node's
+        %% replicas from disk on system start, so a restart rejoins through any
+        %% live quorum with no seed. It is inert when reusing a system portunus
+        %% did not start, since `start_system/2` is then a no-op.
         Config = (ra_system:default_config())#{
                    name => System,
                    data_dir => DataDir,
+                   server_recovery_strategy => registered,
                    names => ra_system:derive_names(System)},
         ensure_system_started(System, Config)
     else
@@ -664,6 +667,8 @@ acquire_with_timeout(Name, LockKey, LeaseId, Owner, TimeoutMs, Opts)
 %% won the race or the lease died and the queue dropped it. The grant's
 %% message may still be in flight, so only a linearizable read can tell;
 %% a late-arriving grant message for an owned key is then harmless.
+-spec settle_timed_out_bid(name(), lock_key(), lease_id()) ->
+    {ok, token()} | {error, timeout | no_quorum}.
 settle_timed_out_bid(Name, LockKey, LeaseId) ->
     case owner(Name, LockKey) of
         {ok, #{lease := LeaseId, token := Token}} ->

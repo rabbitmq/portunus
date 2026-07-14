@@ -27,7 +27,7 @@
          start/3, start/4, stop/1,
          start_node/2, mesh/1,
          wait_leader/2, cluster_info/2, member_count/2,
-         stop_ra_server/2, restart_ra_server/2,
+         stop_ra_server/2, restart_ra_server/2, restart_ra_system/2,
          start_client/1, ccall/3, until_quorum/3, until_quorum/4,
          papi/3,
          await_owner/3, await_owner/4, await_owner/5, await_released/3,
@@ -108,7 +108,6 @@ stop(_) ->
 %% `tick_ms`, and `env` (extra portunus application env pairs).
 -spec start_node([{atom(), term()}], map()) -> {peer:server_ref(), node()}.
 start_node(Config, Opts) ->
-    PrivDir = ?config(priv_dir, Config),
     Prefix = maps:get(name_prefix, Opts, "portunus_node"),
     TickMs = maps:get(tick_ms, Opts, ?TICK_MS),
     {ok, Peer, Node} =
@@ -116,7 +115,7 @@ start_node(Config, Opts) ->
                    %% The default 15s boot wait is too tight under parallel CI.
                    wait_boot => 60000,
                    args => ["-pa" | code:get_path()]}),
-    DataDir = filename:join([PrivDir, atom_to_list(Node)]),
+    DataDir = data_dir(Config, Node),
     _ = rpc:call(Node, application, load, [portunus]),
     ok = rpc:call(Node, application, set_env, [portunus, tick_interval_ms, TickMs]),
     _ = [ok = rpc:call(Node, application, set_env, [portunus, K, V])
@@ -140,6 +139,20 @@ stop_ra_server(Node, Name) ->
 -spec restart_ra_server(node(), atom()) -> ok.
 restart_ra_server(Node, Name) ->
     ok = rpc:call(Node, ra, restart_server, [?SYS, {Name, Node}]).
+
+%% Restart a peer's whole Ra system on its existing data dir, as a full node
+%% restart does, so `registered` recovery rejoins its replicas with no
+%% `restart_server/2` call.
+-spec restart_ra_system([{atom(), term()}], node()) -> ok.
+restart_ra_system(Config, Node) ->
+    ok = rpc:call(Node, ra_system, stop, [?SYS]),
+    ok = rpc:call(Node, portunus, start_system, [?SYS, data_dir(Config, Node)]).
+
+%% The per-node data dir, the single source of truth `start_node/2` and
+%% `restart_ra_system/2` share.
+-spec data_dir([{atom(), term()}], node()) -> file:filename_all().
+data_dir(Config, Node) ->
+    filename:join([?config(priv_dir, Config), atom_to_list(Node)]).
 
 %%----------------------------------------------------------------------
 %% A long-lived client process on a member node. Its pid is the lease holder
