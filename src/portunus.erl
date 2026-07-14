@@ -322,73 +322,83 @@ restart_server(System, Name) ->
 
 -doc """
 Bring this node into cluster `Name` from a host's bootstrap retry loop: recover
-an existing on-disk replica if there is one, otherwise the lowest node in
-`Members` forms a single-node cluster and every other node joins it.
+an existing on-disk replica if there is one, otherwise the first (sorted) node in
+`Members` acts as a seed and forms a single-node cluster and every other node joins it.
 
-`Members` is the stable cluster-wide membership including this node, so every
-node picks the same seed and two nodes can never each form their own cluster (a
-split). A single-node form has no remote dependency, and a join simply retries
-until the seed is up, so this is the bootstrap to run rather than forming across
-several nodes at once, which races their Ra systems coming up. Call
-`start_system/2` first, gate work on `is_member/1`, and call this from a retry
-loop until that holds. Idempotent. See `ensure_started/1` for a coordinated
-start where all members come up together.
+`Members` is the stable cluster-wide membership including this node, so once the Erlang cluster
+is formed, every node picks the same seed.
+
+See `ensure_started/1` which initiates a coordinated start.
+
+If the seed is unreachable, returns `{error, seed_unreachable}` and does not
+reset the member.
 """.
 -spec join_or_form(system(), name(), [node()]) -> ok_or_error(term()).
 join_or_form(System, Name, Members) when is_list(Members), Members =/= [] ->
+    Seed = hd(lists:sort(Members)),
     case restart_server(System, Name) of
         ok ->
-            case is_member(Name) of
-                true ->
-                    %% `restart_server` recovers the replica but, unlike
-                    %% `start_cluster`, does not trigger an election. A recovered
-                    %% single-member cluster has no peer to elect it, so it would
-                    %% sit leaderless after a full node restart. A
-                    %% multi-member cluster re-elects among its peers and must not
-                    %% be forced, so this is scoped to the sole-member case.
-                    maybe_trigger_sole_member_election(Name, Members),
-                    ok;
-                false ->
-                    %% A local server exists but this node is not in its own
-                    %% membership view: an earlier join's `add_member` failed.
-                    %% Finish the join, or the retry loop reports success forever
-                    %% while `is_member/1` stays false.
-                    join_cluster(System, Name, hd(lists:sort(Members)))
+            converge(System, Name, Seed);
+        {error, name_not_registered} when node() =:= Seed ->
+            case start_cluster(System, Name, [node()]) of
+                {ok, _, _} -> ok;
+                {error, _} = Err -> Err
             end;
         {error, name_not_registered} ->
-            Seed = hd(lists:sort(Members)),
-            case node() =:= Seed of
-                true ->
-                    case start_cluster(System, Name, [node()]) of
-                        {ok, _, _} -> ok;
-                        {error, _} = Err -> Err
-                    end;
-                false ->
-                    join_cluster(System, Name, Seed)
-            end;
+            join_cluster(System, Name, Seed);
         {error, _} = Err ->
             Err
     end.
 
-%% Trigger an election for a recovered single-member cluster, which `ra` would
-%% otherwise leave passive (only `start_cluster` triggers the initial one), so it
-%% would sit leaderless after a full node restart with no peer to elect it.
+%% Forces "orphan" members to rejoin their seed; a member already with the seed is
+%% left alone.
 %%
-%% The decisive fact is this node's *actual recovered* membership, not the
-%% caller's intended `Members`: mid-bootstrap a node may have formed a sole-member
-%% cluster on disk while the caller already knows the full node set. A local
-%% membership query (answered without a leader) tells us the truth. A genuine
-%% multi-member cluster re-elects among its peers and must not be forced.
-%% Idempotent: harmless if the server is already the leader.
-maybe_trigger_sole_member_election(Name, _Members) ->
+%% This function is needed during initial cluster formation because members can be
+%% started in parallel. It has no effect on members that have already rejoined
+%% their cluster (seed).
+converge(System, Name, Seed) ->
     ServerId = {Name, node()},
     case ra:members({local, ServerId}, ?CMD_TIMEOUT) of
-        {ok, [ServerId], _Leader} ->
-            _ = catch ra:trigger_election(ServerId),
-            ok;
+        {ok, Members, _Leader} ->
+            case lists:member(ServerId, Members) andalso has_log_entries(ServerId) of
+                true when node() =:= Seed ->
+                    maybe_trigger_single_member_election(ServerId, Members),
+                    ok;
+                true ->
+                    case lists:member({Name, Seed}, Members) of
+                        true -> ok;
+                        false -> merge_into_seed(System, Name, Seed, ServerId)
+                    end;
+                false ->
+                    join_cluster(System, Name, Seed)
+            end;
         _ ->
-            ok
+            %% Local query timed out. Retry rather than joining "as is", so a
+            %% "seedless" member is not added without the reset `merge_into_seed/4`
+            %% applies to it.
+            {error, local_view_unavailable}
     end.
+
+%% Asks the seed if given node is its cluster member. If not,
+%% resets the node, then joins the seed.
+merge_into_seed(System, Name, Seed, ServerId) ->
+    case ra:members({Name, Seed}, ?CMD_TIMEOUT) of
+        {ok, SeedMembers, _Leader} ->
+            case lists:member(ServerId, SeedMembers) of
+                true -> ok;
+                false -> reset_and_join_cluster(System, Name, Seed)
+            end;
+        _ ->
+            {error, seed_unreachable}
+    end.
+
+%% A single-member cluster recovered by `restart_server/2` is leaderless. Only
+%% `start_cluster/3` triggers the initial election, so call it explicitly.
+maybe_trigger_single_member_election(ServerId, [ServerId]) ->
+    _ = catch ra:trigger_election(ServerId),
+    ok;
+maybe_trigger_single_member_election(_ServerId, _Members) ->
+    ok.
 
 %% Set both identically on every node: `init/1` stores them in replicated
 %% state.

@@ -135,7 +135,7 @@ node_crash_holds_lock_until_lease_expiry(Config) ->
     %% second on, rather than fast-released by the monitor going down.
     timer:sleep(1000),
     ?assertMatch({ok, #{owner := owner_a}},
-                 portunus_ct_cluster:papi(hd(Survivors), owner, [?NAME, Key])),
+                 rpc:call(hd(Survivors), portunus, owner, [?NAME, Key])),
     %% With nothing left to renew it, though, the lease expires and the
     %% lock is reclaimed.
     portunus_ct_cluster:await_released(hd(Survivors), ?NAME, Key),

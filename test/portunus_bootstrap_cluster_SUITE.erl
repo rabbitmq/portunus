@@ -65,7 +65,7 @@ independent_bootstrap_forms_one_cluster(Config) ->
     ?assert(lists:member(LeaderNode, Nodes)),
     %% The formed cluster accepts writes.
     ?assertMatch({ok, _},
-                 portunus_ct_cluster:papi(LeaderNode, grant_lease, [?NAME, ?TTL])).
+                 rpc:call(LeaderNode, portunus, grant_lease, [?NAME, ?TTL])).
 
 %% The split a concurrent boot can produce, then its repair: every node forms
 %% its own single-node cluster, and the non-seed nodes each `reset_and_join` the
@@ -76,11 +76,10 @@ reset_and_join_merges_split_clusters(Config) ->
     #{nodes := Nodes} = ?config(cluster, Config),
     [Seed | Rest] = Nodes,
     _ = [?assertMatch({ok, _, _},
-                      portunus_ct_cluster:papi(N, start_cluster, [?SYS, ?NAME, [N]]))
+                      rpc:call(N, portunus, start_cluster, [?SYS, ?NAME, [N]]))
          || N <- Nodes],
     _ = [?assertEqual(ok,
-                      portunus_ct_cluster:papi(
-                        N, reset_and_join_cluster, [?SYS, ?NAME, Seed]))
+                      rpc:call(N, portunus, reset_and_join_cluster, [?SYS, ?NAME, Seed]))
          || N <- Rest],
     ?assertEqual(?SIZE, portunus_ct_cluster:member_count(Nodes, ?NAME)),
     {?NAME, LeaderNode} = portunus_ct_cluster:wait_leader(Nodes, ?NAME),
@@ -96,7 +95,7 @@ reset_and_join_merges_split_clusters(Config) ->
 bootstrap(Nodes, 0) ->
     ct:fail({bootstrap_timed_out, Nodes});
 bootstrap(Nodes, Retries) ->
-    _ = [portunus_ct_cluster:papi(Node, join_or_form, [?SYS, ?NAME, Nodes])
+    _ = [rpc:call(Node, portunus, join_or_form, [?SYS, ?NAME, Nodes])
          || Node <- Nodes],
     case portunus_ct_cluster:member_count(Nodes, ?NAME) of
         ?SIZE -> ok;

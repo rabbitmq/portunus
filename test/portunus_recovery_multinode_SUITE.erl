@@ -76,7 +76,7 @@ registered_recovery_rejoins_after_system_restart(Config) ->
     Token = place_lock(Survivor, Key),
     ok = portunus_ct_cluster:restart_ra_system(Config, Seed),
     ok = portunus_ct_cluster:wait_until(
-           fun() -> portunus_ct_cluster:papi(Seed, is_member, [?NAME]) =:= true end),
+           fun() -> rpc:call(Seed, portunus, is_member, [?NAME]) =:= true end),
     {?NAME, _} = portunus_ct_cluster:wait_leader(Nodes, ?NAME),
     portunus_ct_cluster:await_owner(Seed, ?NAME, Key, owner_a, Token).
 

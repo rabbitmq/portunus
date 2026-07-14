@@ -29,7 +29,6 @@
          wait_leader/2, cluster_info/2, member_count/2,
          stop_ra_server/2, restart_ra_server/2, restart_ra_system/2,
          start_client/1, ccall/3, until_quorum/3, until_quorum/4,
-         papi/3,
          await_owner/3, await_owner/4, await_owner/5, await_released/3,
          wait_until/1, wait_until/2]).
 %% Spawned on the peer nodes, so it must be exported.
@@ -197,11 +196,6 @@ until_quorum(Pid, F, A, N) ->
         Reply -> Reply
     end.
 
-%% A stateless portunus query, run via a transient process on a member node.
--spec papi(node(), atom(), [term()]) -> term().
-papi(Node, F, A) ->
-    rpc:call(Node, portunus, F, A).
-
 %%----------------------------------------------------------------------
 %% Cluster introspection and waiting
 %%----------------------------------------------------------------------
@@ -255,7 +249,7 @@ wait_leader(Nodes, Name, N) ->
 -spec await_owner(node(), atom(), term()) -> ok.
 await_owner(Node, Name, Key) ->
     wait_until(fun() ->
-                       case papi(Node, owner, [Name, Key]) of
+                       case rpc:call(Node, portunus, owner, [Name, Key]) of
                            {ok, #{owner := _}} -> true;
                            _ -> false
                        end
@@ -264,7 +258,7 @@ await_owner(Node, Name, Key) ->
 -spec await_owner(node(), atom(), term(), term()) -> ok.
 await_owner(Node, Name, Key, Owner) ->
     wait_until(fun() ->
-                       case papi(Node, owner, [Name, Key]) of
+                       case rpc:call(Node, portunus, owner, [Name, Key]) of
                            {ok, #{owner := Owner}} -> true;
                            _ -> false
                        end
@@ -273,7 +267,7 @@ await_owner(Node, Name, Key, Owner) ->
 -spec await_owner(node(), atom(), term(), term(), portunus:token()) -> ok.
 await_owner(Node, Name, Key, Owner, Token) ->
     wait_until(fun() ->
-                       case papi(Node, owner, [Name, Key]) of
+                       case rpc:call(Node, portunus, owner, [Name, Key]) of
                            {ok, #{owner := Owner, token := Token}} -> true;
                            _ -> false
                        end
@@ -281,7 +275,7 @@ await_owner(Node, Name, Key, Owner, Token) ->
 
 -spec await_released(node(), atom(), term()) -> ok.
 await_released(Node, Name, Key) ->
-    wait_until(fun() -> papi(Node, owner, [Name, Key]) =:= {error, not_held} end).
+    wait_until(fun() -> rpc:call(Node, portunus, owner, [Name, Key]) =:= {error, not_held} end).
 
 -spec wait_until(fun(() -> boolean())) -> ok.
 wait_until(Fun) ->
