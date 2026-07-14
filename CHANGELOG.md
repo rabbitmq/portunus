@@ -1,4 +1,9 @@
-## Changes in `0.8.0`
+## Changes in `0.9.0` (in development)
+
+No changes yet.
+
+
+## Changes in `0.8.0` (Jul 14, 2026)
 
 ### Enhancements
 
@@ -17,6 +22,6 @@
  * Multiple small bug fixes
 
 
-## Changes in `0.7.0`
+## Changes in `0.7.0` (never released to hex.pm)
 
 Initial commit.
