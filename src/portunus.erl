@@ -359,6 +359,13 @@ join_or_form(System, Name, Members) when is_list(Members), Members =/= [] ->
 converge(System, Name, Seed) ->
     ServerId = {Name, node()},
     case ra:members({local, ServerId}, ?CMD_TIMEOUT) of
+        {ok, [ServerId], _Leader} when node() =:= Seed ->
+            %% Sole-member seed recovered leaderless with an empty log (formed,
+            %% then restarted before committing): elect it regardless of
+            %% `has_log_entries/1`, which is false here and would misroute to
+            %% `join_cluster/3` against a leaderless local replica.
+            maybe_trigger_single_member_election(ServerId, [ServerId]),
+            ok;
         {ok, Members, _Leader} ->
             case lists:member(ServerId, Members) andalso has_log_entries(ServerId) of
                 true when node() =:= Seed ->
