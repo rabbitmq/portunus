@@ -57,6 +57,9 @@ target any member's replica (`reset_server/2`).
 %% the race that reaches it in production cannot be timed deterministically.
 -export([settle_timed_out_bid/3]).
 
+%% Exported (undocumented) so seed selection is testable with a supplied predicate.
+-export([effective_seed/2]).
+
 -include("portunus.hrl").
 
 -define(CMD_TIMEOUT, 5000).
@@ -289,11 +292,10 @@ add_self(Leader, ServerId) ->
 -doc """
 Reset this node's replica of cluster `Name` and join the cluster that `SeedNode`
 belongs to. Unlike `join_cluster/3`, this first wipes any existing local replica,
-so a node that formed its own single-node cluster on boot can be merged into an
-existing cluster rather than colliding with it. This mirrors the reset-then-join
-a host performs when a standalone node joins a cluster: each node boots its own
-single-node cluster, and merging happens on the explicit join, so concurrent
-boots never split-form. The local replica's state is discarded, so call this
+so a node that formed its own single-node cluster during parallel boot can be merged into an
+existing cluster rather than colliding with it.
+
+The local replica's state is discarded, so call this
 during cluster formation, before the node holds any leases worth keeping.
 """.
 -spec reset_and_join_cluster(system(), name(), node()) -> ok_or_error(term()).
@@ -305,11 +307,10 @@ reset_and_join_cluster(System, Name, SeedNode) ->
 
 -doc """
 Restart this node's replica of cluster `Name`, recovering its state from disk.
-Use after the `ra` application or the node restarted: `start_system/2` rebuilds
-the Ra system but does not bring back the servers, so a member rejoins by
-restarting its replica. Idempotent: ok if the replica is already running.
-Returns `{error, name_not_registered}` if this node has no on-disk replica of
-`Name`, in which case it was never a member and should `start_cluster/3` or
+Use this after `start_system/2`, which rebuilds the Ra system.
+
+Returns `{error, name_not_registered}` if this node has no on-disk member data for
+`Name`, in which case it was never a member and should use `start_cluster/3` or
 `join_cluster/3` instead.
 """.
 -spec restart_server(system(), name()) -> ok_or_error(term()).
@@ -321,33 +322,92 @@ restart_server(System, Name) ->
     end.
 
 -doc """
-Bring this node into cluster `Name` from a host's bootstrap retry loop: recover
-an existing on-disk replica if there is one, otherwise the first (sorted) node in
-`Members` acts as a seed and forms a single-node cluster and every other node joins it.
+Attempts to join an existing `portunus` Raft cluster or create one.
 
-`Members` is the stable cluster-wide membership including this node, so once the Erlang cluster
-is formed, every node picks the same seed.
+The algorithm is based on the concept of a seed member (cluster node)
+that is computed as the lowest (in lexicographical order) reachable node
+on the `Members` list. The `Members` list *MUST* include the current node:
+when using the return value of `erlang:nodes/0`, don't forget to
+prepend the value of `erlang:node/0` as well.
 
-See `ensure_started/1` which initiates a coordinated start.
+The seed node is asynchronously and independently agreed on by different
+members, not pre-selected or pre-computed before deployment time.
 
-If the seed is unreachable, returns `{error, seed_unreachable}` and does not
-reset the member.
+When a new cluster is formed and a member computes that it itself is the seed,
+it kicks off a Raft election. This is true for both single-node and multi-node
+clusters.
+
+Most designs that calculate a seed node suffer from that node not being
+available. In order to avoid this, `portunus` picks the lowest (first)
+reachable member and if that turns out to be a different member, (re)joins that
+member's existing Raft cluster.
+
+If the member (node) has existing on-disk member data and the computed seed responds
+that the asking (calling) member is *not* on its known cluster member list,
+such node will reset itself and join the seed's Raft cluster.
+
+When the seed member `PS` is restarted and finds its pre-existing member data, it will also
+compute the seed and should the seed node have changed during the `PS` absence,
+join the new seed's cluster. If the existing on-disk data includes the new seed `NS`,
+the rejoining `PS` will not reset itself and instead will catch up with the
+current Raft leader.
+
+However, it's important to explain when the reset happens. The newly joining
+member will clarify its membership with the seed and only then perform
+the reset and join the seed.
+
+The companion function that initiates a coordinated start is `ensure_started/1`.
+
+If the seed is unreachable, returns an error (such as `{error, seed_unreachable}`) and does not
+reset the local member.
 """.
 -spec join_or_form(system(), name(), [node()]) -> ok_or_error(term()).
 join_or_form(System, Name, Members) when is_list(Members), Members =/= [] ->
-    Seed = hd(lists:sort(Members)),
+    Seed = effective_seed(Members),
     case restart_server(System, Name) of
         ok ->
             converge(System, Name, Seed);
         {error, name_not_registered} when node() =:= Seed ->
-            case start_cluster(System, Name, [node()]) of
-                {ok, _, _} -> ok;
-                {error, _} = Err -> Err
-            end;
+            form_or_join_existing(System, Name, Members);
         {error, name_not_registered} ->
             join_cluster(System, Name, Seed);
         {error, _} = Err ->
             Err
+    end.
+
+-spec effective_seed([node()]) -> node().
+effective_seed(Members) ->
+    effective_seed(Members, fun is_reachable/1).
+
+%% Lowest-sorted reachable member; `node()` is always one, so the match never fails.
+-spec effective_seed([node()], fun((node()) -> boolean())) -> node().
+effective_seed(Members, IsReachable) ->
+    {value, Seed} = lists:search(IsReachable, lists:sort(Members)),
+    Seed.
+
+is_reachable(Node) ->
+    Node =:= node()
+        orelse lists:member(Node, nodes())
+        orelse net_adm:ping(Node) =:= pong.
+
+%% Form only when no reachable member runs a cluster, so a returning lowest node
+%% joins it rather than form a rival the merge would wipe.
+form_or_join_existing(System, Name, Members) ->
+    Others = [N || N <- lists:sort(Members), N =/= node(), is_reachable(N)],
+    case lists:search(fun(N) -> has_cluster(Name, N) end, Others) of
+        {value, Peer} ->
+            join_cluster(System, Name, Peer);
+        false ->
+            case start_cluster(System, Name, [node()]) of
+                {ok, _, _} -> ok;
+                {error, _} = Err -> Err
+            end
+    end.
+
+has_cluster(Name, Node) ->
+    case ra:members({Name, Node}, ?CMD_TIMEOUT) of
+        {ok, _, _} -> true;
+        _ -> false
     end.
 
 %% Forces "orphan" members to rejoin their seed; a member already with the seed is

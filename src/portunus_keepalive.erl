@@ -6,7 +6,7 @@
 %%
 -module(portunus_keepalive).
 -moduledoc """
-This module implements automatic background lease renewals
+This module implements automatic background lease renewal
 for a holder that is an Erlang process.
 
 It is linked to the caller (usually the resource holder) and
