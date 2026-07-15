@@ -19,7 +19,7 @@
          healthy_lease_is_renewed_past_ttl/1,
          transient_failure_does_not_lose_lease/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_keepalive_unit_sys).
 -define(NAME, portunus_keepalive_test).
 -define(TTL, 3000).
 

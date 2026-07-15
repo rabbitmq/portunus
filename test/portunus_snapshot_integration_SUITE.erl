@@ -16,7 +16,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([state_survives_snapshot_recovery/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_snapshot_integration_sys).
 -define(NAME, portunus_snapshot_test).
 
 all() ->

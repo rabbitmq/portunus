@@ -19,7 +19,7 @@
 %% Runs on the seed peer over rpc.
 -export([spin_commands/3]).
 
--define(SYS, portunus).
+-define(SYS, portunus_snapshot_install_integration_sys).
 -define(NAME, portunus_snap_install_test).
 
 all() ->

@@ -18,7 +18,7 @@
 -export([unlock_after_renewer_death_is_ok/1,
          with_lock_survives_renewer_death/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_stop_noproc_unit_sys).
 -define(NAME, portunus_stop_noproc_test).
 
 all() ->

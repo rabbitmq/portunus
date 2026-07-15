@@ -17,7 +17,7 @@
 -export([same_id_in_two_registries_both_run/1]).
 -export([start_worker/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_namespacing_sys).
 -define(NAME, portunus_namespacing_test).
 
 all() ->

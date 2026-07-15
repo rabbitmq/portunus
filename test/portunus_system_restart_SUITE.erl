@@ -148,28 +148,15 @@ restart_server_reports_not_found_for_non_member(Config) ->
 %% `already_present`; `start_system/2` drops that child and starts a fresh one.
 already_present_child_is_dropped_and_restarted(Config) ->
     Dir = dir(Config),
-    ok = meck:new(ra_system, [passthrough, no_link]),
-    Self = self(),
-    meck:expect(ra_system, start,
-                fun(Cfg) ->
-                        case meck:passthrough([Cfg]) of
-                            {error, {already_started, _}} ->
-                                Self ! present,
-                                {error, already_present};
-                            Other ->
-                                Other
-                        end
-                end),
-    try
-        ok = portunus:start_system(?SYS, Dir),
-        %% The first call started the system; a second sees the mocked
-        %% `already_present`, which must trigger a stop and a retry.
-        ok = portunus:start_system(?SYS, Dir),
-        receive present -> ok after 1000 -> ct:fail(already_present_not_exercised) end,
-        ?assert(meck:called(ra_system, stop, [?SYS]))
-    after
-        meck:unload(ra_system)
-    end.
+    ok = portunus:start_system(?SYS, Dir),
+    %% Terminate without deleting, which is exactly what `already_present` is: the
+    %% child spec stays and its processes are gone.
+    ok = supervisor:terminate_child(ra_systems_sup, ?SYS),
+    ?assertEqual({error, already_present}, ra_system:start(ra_system:fetch(?SYS))),
+    ok = portunus:start_system(?SYS, Dir),
+    {ok, _, _} = portunus:start_cluster(?SYS, ?NAME, [node()]),
+    ok = portunus_test_helpers:await_leader(?NAME),
+    ?assertMatch({ok, _}, portunus:grant_lease(?NAME, ?TTL)).
 
 %%----------------------------------------------------------------------
 %% Helpers

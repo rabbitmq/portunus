@@ -20,7 +20,8 @@
          reset_server_refuses_when_membership_unknown/1,
          ensure_started_forms_a_local_cluster/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_lifecycle_sys).
+-define(ENSURE_SYS, portunus_lifecycle_ensure_sys).
 -define(NAME, portunus_lifecycle_test).
 
 all() ->
@@ -40,8 +41,9 @@ init_per_suite(Config) ->
 
 end_per_suite(_Config) ->
     catch ra:stop_server(?SYS, {?NAME, node()}),
-    catch ra:stop_server(?SYS, {portunus_lifecycle_ensure, node()}),
+    catch ra:stop_server(?ENSURE_SYS, {portunus_lifecycle_ensure, node()}),
     catch ra:stop_server(?SYS, {portunus_lifecycle_reset, node()}),
+    catch ra_system:stop(?ENSURE_SYS),
     ok.
 
 join_cluster_is_idempotent_for_a_member(_Config) ->
@@ -64,10 +66,13 @@ reset_server_refuses_when_membership_unknown(_Config) ->
     ok = portunus:restart_server(?SYS, Name),
     ok = portunus_test_helpers:await_leader(Name).
 
+%% Its own system, since it asks for its own directory: naming `?SYS`, which
+%% `init_per_suite` already started elsewhere, is asking for a directory it would
+%% not get.
 ensure_started_forms_a_local_cluster(Config) ->
     Name = portunus_lifecycle_ensure,
     DataDir = filename:join(?config(priv_dir, Config), "ensure"),
-    {ok, [_ | _], _} = portunus:ensure_started(#{ra_system => ?SYS,
+    {ok, [_ | _], _} = portunus:ensure_started(#{ra_system => ?ENSURE_SYS,
                                                  name => Name,
                                                  data_dir => DataDir,
                                                  membership => local}),

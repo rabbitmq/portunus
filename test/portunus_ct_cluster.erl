@@ -25,10 +25,11 @@
 
 -export([ensure_distribution/0,
          start/3, start/4, stop/1,
-         start_node/2, mesh/1,
+         start_node/2, mesh/1, data_dir/2, await_registered/3,
          wait_leader/2, cluster_info/2, member_count/2,
          stop_ra_server/2, restart_ra_server/2, restart_ra_system/2,
          start_client/1, ccall/3, until_quorum/3, until_quorum/4,
+         converge_all/3, place_lock/3,
          await_owner/3, await_owner/4, await_owner/5, await_released/3,
          wait_until/1, wait_until/2]).
 %% Spawned on the peer nodes, so it must be exported.
@@ -131,6 +132,15 @@ mesh(Nodes) ->
 %% Fault injection (run on the owning node, which itself stays up)
 %%----------------------------------------------------------------------
 
+%% Wait until a peer's ra directory registers `Name`: the readiness signal for
+%% anything that depends on the server being recoverable on that node.
+-spec await_registered(node(), atom(), atom()) -> ok.
+await_registered(Node, System, Name) ->
+    wait_until(fun() ->
+                       is_binary(rpc:call(Node, ra_directory, uid_of,
+                                          [System, Name], 5000))
+               end).
+
 -spec stop_ra_server(node(), atom()) -> ok.
 stop_ra_server(Node, Name) ->
     ok = rpc:call(Node, ra, stop_server, [?SYS, {Name, Node}]).
@@ -152,6 +162,24 @@ restart_ra_system(Config, Node) ->
 -spec data_dir([{atom(), term()}], node()) -> file:filename_all().
 data_dir(Config, Node) ->
     filename:join([?config(priv_dir, Config), atom_to_list(Node)]).
+
+%% `join_or_form/3` on every live node each round until all are one cluster.
+-spec converge_all([node()], [node()], atom()) -> ok.
+converge_all(Members, LiveNodes, Name) ->
+    wait_until(fun() ->
+                       _ = [rpc:call(N, portunus, join_or_form,
+                                     [?SYS, Name, Members]) || N <- LiveNodes],
+                       member_count(LiveNodes, Name) =:= length(LiveNodes)
+               end).
+
+%% A lock held by a long-lived client on `Node`, so the lease outlives the call.
+-spec place_lock(node(), atom(), term()) -> portunus:token().
+place_lock(Node, Name, Key) ->
+    Client = start_client(Node),
+    {ok, Lease} = until_quorum(Client, grant_lease, [Name, 60000]),
+    {ok, Token} = until_quorum(Client, acquire, [Name, Key, Lease, owner_a]),
+    await_owner(Node, Name, Key, owner_a, Token),
+    Token.
 
 %%----------------------------------------------------------------------
 %% A long-lived client process on a member node. Its pid is the lease holder

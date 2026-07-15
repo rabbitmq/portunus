@@ -19,7 +19,7 @@
          revoke_sends_no_notice/1,
          expired_holder_receives_lease_lost/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_expiry_notice_unit_sys).
 -define(NAME, portunus_expiry_notice_test).
 
 all() ->

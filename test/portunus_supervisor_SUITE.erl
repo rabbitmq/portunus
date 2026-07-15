@@ -25,7 +25,7 @@
          transfer_and_which_children_delegate/1]).
 -export([init/1, start_worker/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_supervisor_sys).
 -define(NAME, portunus_supervisor_test).
 
 all() ->

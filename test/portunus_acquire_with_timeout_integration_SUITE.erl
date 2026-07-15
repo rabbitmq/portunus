@@ -24,7 +24,7 @@
          settle_returns_a_key_the_race_granted/1,
          settle_without_the_key_is_timeout/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_acquire_with_timeout_integration_sys).
 -define(NAME, portunus_acquire_with_timeout_test).
 
 all() ->

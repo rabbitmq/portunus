@@ -24,7 +24,7 @@
          watch_ref_round_trips/1,
          is_member_reports_membership/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_api_sys).
 -define(NAME, portunus_api_test).
 -define(TTL, 60000).
 

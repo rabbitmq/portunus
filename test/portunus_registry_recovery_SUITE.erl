@@ -21,7 +21,7 @@
          local_sup_death_stops_registry/1]).
 -export([start_worker/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_registry_recovery_sys).
 -define(NAME, portunus_registry_recovery_test).
 -define(TTL, 2000).
 

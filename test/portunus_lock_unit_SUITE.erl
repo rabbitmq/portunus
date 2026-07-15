@@ -16,7 +16,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([with_lock_releases_on_exception/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_lock_unit_sys).
 -define(NAME, portunus_lock_test).
 
 all() ->

@@ -18,7 +18,7 @@
 -export([promotion_skips_a_contender_that_left/1,
          leave_without_a_bid_is_not_queued/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_leave_queue_integration_sys).
 -define(NAME, portunus_leave_queue_test).
 
 all() ->

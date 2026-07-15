@@ -26,7 +26,7 @@
 %% worker start for child specs
 -export([start_worker/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_registry_hardening_unit_sys).
 -define(NAME, portunus_reg_hardening_test).
 -define(TTL, 2000).
 

@@ -20,7 +20,7 @@
          explicit_revoke_ends_auto_renew/1,
          auto_renew_honours_proposed_id/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_lease_renewal_sys).
 -define(NAME, portunus_renewal_test).
 %% A TTL short enough for a test to wait past quickly, yet wide enough that
 %% the renewer (every TTL/3, floored at 1s) keeps a comfortable margin.

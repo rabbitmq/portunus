@@ -20,7 +20,7 @@
          re_watch_supersedes_the_old_ref/1,
          watcher_death_drops_the_watch/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_watch_unit_sys).
 -define(NAME, portunus_watch_test).
 
 all() ->

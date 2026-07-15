@@ -17,7 +17,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([gauges_are_populated/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_metrics_sys).
 -define(NAME, portunus_metrics_test).
 
 all() ->

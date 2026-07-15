@@ -39,7 +39,7 @@
 %% Started on the local node by the registry test's child spec.
 -export([start_registry_worker/1, noop_start/0]).
 
--define(SYS, portunus).
+-define(SYS, portunus_sys).
 -define(NAME, portunus_test).
 
 all() ->

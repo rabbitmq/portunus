@@ -33,7 +33,7 @@
          uncommitted_no_quorum_restores_owner_on_same_token/1,
          committed_no_quorum_recontends_without_restart/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_election_transfer_unit_sys).
 -define(NAME, portunus_election_transfer_test).
 -define(TTL, 3000).
 -define(PEER, 'peer@nohost').

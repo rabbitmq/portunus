@@ -17,7 +17,7 @@
          init_per_testcase/2, end_per_testcase/2]).
 -export([release_under_no_quorum_keeps_key/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_session_release_sys).
 -define(NAME, portunus_session_release_test).
 -define(TTL, 60000).
 

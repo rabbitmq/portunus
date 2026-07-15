@@ -19,7 +19,7 @@
 %% portunus_election callbacks
 -export([elected/1, stepped_down/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_election_return_unit_sys).
 -define(NAME, portunus_election_return_test).
 
 all() ->

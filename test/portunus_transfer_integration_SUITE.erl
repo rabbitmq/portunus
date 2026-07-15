@@ -19,7 +19,7 @@
 -export([stale_token_is_refused_after_handoff/1,
          transfer_counters_are_published/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_transfer_integration_sys).
 -define(NAME, portunus_transfer_integration_test).
 
 all() ->

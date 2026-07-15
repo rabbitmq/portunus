@@ -21,7 +21,7 @@
 -export([join_cluster_retry_completes_a_half_join/1,
          join_or_form_finishes_a_half_join/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_join_retry_integration_sys).
 
 all() ->
     [join_cluster_retry_completes_a_half_join,

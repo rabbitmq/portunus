@@ -22,7 +22,7 @@
          transfer_to_unready_target_refuses_without_stepdown/1,
          transfer_to_non_owner_is_not_owner/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_election_unit_sys).
 -define(NAME, portunus_election_test).
 -define(TTL, 3000).
 

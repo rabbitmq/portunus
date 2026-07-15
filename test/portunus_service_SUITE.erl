@@ -26,7 +26,7 @@
          duplicate_keys_start_one_election/1]).
 -export([keys/1, start/3, stop/2]).
 
--define(SYS, portunus).
+-define(SYS, portunus_service_sys).
 -define(NAME, portunus_service_test).
 -define(TTL, 2000).
 

@@ -17,7 +17,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2]).
 -export([lease_loss_stops_session_and_frees_keys/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_session_unit_sys).
 -define(NAME, portunus_session_test).
 -define(TTL, 3000).
 

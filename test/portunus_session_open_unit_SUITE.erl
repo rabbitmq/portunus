@@ -21,7 +21,7 @@
          double_close_is_ok/1,
          immediate_reopen_with_proposed_id_succeeds/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_session_open_unit_sys).
 -define(NAME, portunus_session_open_test).
 
 all() ->

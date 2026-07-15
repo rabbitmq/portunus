@@ -15,6 +15,7 @@
 
 -export([await_condition/1, await_condition/2,
          await_leader/1, await_leader/2,
+         await_registered/2,
          meta/1, meta/2, quickcheck/2]).
 
 %% A valid `ra_machine:command_meta_data()` for driving `portunus_machine:apply/3`
@@ -52,6 +53,12 @@ await_retries(Fun, Retries) ->
         true -> ok;
         _ -> timer:sleep(50), await_retries(Fun, Retries - 1)
     end.
+
+%% The registration is what recovery finds a server by, so "the directory knows
+%% this server" is the readiness signal to wait on after a system start.
+-spec await_registered(portunus:system(), portunus:name()) -> ok.
+await_registered(System, Name) ->
+    await_condition(fun() -> is_binary(ra_directory:uid_of(System, Name)) end).
 
 -spec await_leader(portunus:name()) -> ok.
 await_leader(Name) ->

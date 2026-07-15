@@ -17,7 +17,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([no_quorum_returns_error_and_counts/1]).
 
--define(SYS, portunus).
+-define(SYS, portunus_no_quorum_unit_sys).
 -define(NAME, portunus_no_quorum_test).
 
 all() ->

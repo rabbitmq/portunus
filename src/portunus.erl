@@ -60,6 +60,10 @@ target any member's replica (`reset_server/2`).
 %% Exported (undocumented) so seed selection is testable with a supplied predicate.
 -export([effective_seed/1, effective_seed/2]).
 
+%% Exported (undocumented) so the Ra system config comparison is testable without
+%% a running system, and the peers' views without a cluster.
+-export([config_mismatch/2, peer_views/3]).
+
 -include("portunus.hrl").
 
 -define(CMD_TIMEOUT, 5000).
@@ -142,6 +146,13 @@ target any member's replica (`reset_server/2`).
 -doc """
 Start a dedicated Ra system to use for `portunus`. Idempotent, and safe to call
 again after the `ra` application has been restarted.
+
+Naming a system that is already running under a different configuration returns
+`{error, {ra_system_mismatch, System, Mismatch}}`, where `Mismatch` maps each
+disagreeing key to `{Wanted, Running}`. It is terminal rather than retryable: no
+number of retries makes two directories agree. A system whose WAL is in another
+system's directory loses committed entries, and one without
+`server_recovery_strategy => registered` does not recover this node's replicas.
 """.
 -spec start_system(system(), file:filename_all()) -> ok_or_error(term()).
 start_system(System, DataDir) ->
@@ -159,6 +170,11 @@ start_system(System, DataDir) ->
         Config = (ra_system:default_config())#{
                    name => System,
                    data_dir => DataDir,
+                   %% `default_config/0` points this at `ra_env:data_dir/0`,
+                   %% another system's directory under a host such as RabbitMQ.
+                   %% Ra recovers every `*.wal` in a directory whoever wrote it,
+                   %% and deletes the ones whose UID it does not know.
+                   wal_data_dir => DataDir,
                    server_recovery_strategy => registered,
                    names => ra_system:derive_names(System)},
         ensure_system_started(System, Config)
@@ -166,7 +182,13 @@ start_system(System, DataDir) ->
         {error, _} = Err -> Err
     end.
 
-%% Always go through `ra_system:start/1`: it re-creates the system, and
+%% A system portunus did not start never sees `Config`, so refuse one that
+%% disagrees with it rather than run against it. Compare before
+%% `ra_system:start/1`: `ra_systems_sup:start_system/1` stores the config before
+%% it checks the child, so comparing after `{already_started, _}` compares
+%% `Config` against itself.
+%%
+%% Otherwise always go through `ra_system:start/1`: it re-creates the system, and
 %% recovers its servers from disk, whenever the `ra` application has been
 %% restarted. Guarding on `ra_system:fetch/1` instead would skip that, because
 %% its config lives in a `persistent_term` that outlives the system's processes,
@@ -174,12 +196,149 @@ start_system(System, DataDir) ->
 %% `already_present` is a child spec left by a torn-down system: drop it and
 %% start again.
 ensure_system_started(System, Config) ->
-    case ra_system:start(Config) of
-        {error, already_present} ->
-            _ = ra_system:stop(System),
-            started(ra_system:start(Config));
-        Result ->
-            started(Result)
+    case running_config(System) of
+        undefined ->
+            ok = repair_registrations(Config),
+            case ra_system:start(Config) of
+                {error, already_present} ->
+                    _ = ra_system:stop(System),
+                    started(ra_system:start(Config));
+                Result ->
+                    started(Result)
+            end;
+        Running ->
+            configs_agree(System, Config, Running)
+    end.
+
+%% A server's registration is a DETS write that a hard kill can lose (Ra's
+%% directory auto-saves every 500 ms) while the replica's directory, config and
+%% log survive. Repair it from the replicas' own `config` files, the artefact
+%% `ra_log_pre_init` already trusts. It must happen before `ra_system:start/1`:
+%% WAL recovery deletes the entries of any writer whose UID is not registered,
+%% so a later repair finds the log already truncated.
+repair_registrations(#{data_dir := Dir,
+                       names := #{directory_rev := Rev}}) ->
+    case local_server_configs(Dir) of
+        [] ->
+            ok;
+        Configs ->
+            DetsFile = filename:join(Dir, "names.dets"),
+            {ok, Rev} = dets:open_file(Rev, [{file, DetsFile},
+                                             {auto_save, 500}]),
+            try
+                lists:foreach(
+                  fun({Name, UId}) ->
+                          ok = repair_registration(Dir, Rev, Name, UId)
+                  end, sole_claims(Configs))
+            after
+                _ = dets:sync(Rev),
+                _ = dets:close(Rev)
+            end
+    end.
+
+repair_registration(Dir, Rev, Name, UId) ->
+    case dets:lookup(Rev, Name) of
+        [] ->
+            dets:insert(Rev, {Name, UId});
+        [{_, UId}] ->
+            ok;
+        [{_, Stale}] ->
+            %% A registered UID whose directory is gone would be unregistered by
+            %% `ra_log_pre_init` anyway; replace it only then, or the current
+            %% replica stays unreachable behind a dead registration.
+            case filelib:is_dir(filename:join(Dir, Stale)) of
+                true -> ok;
+                false -> dets:insert(Rev, {Name, UId})
+            end
+    end.
+
+%% This node's server names and UIDs, read from the `config` files under the
+%% system's data directory.
+local_server_configs(Dir) ->
+    [{element(1, Id), maps:get(uid, C)}
+     || Sub <- server_dirs(Dir),
+        {ok, C} <- [ra_log:read_config(Sub)],
+        is_map(C), is_map_key(uid, C),
+        Id <- [maps:get(id, C, undefined)],
+        is_tuple(Id), tuple_size(Id) =:= 2, element(2, Id) =:= node()].
+
+%% Only a name claimed by exactly one directory is repairable: the registration
+%% was the record of which of several is current, so do not guess.
+sole_claims(NameUIds) ->
+    ByName = maps:groups_from_list(fun({N, _}) -> N end, NameUIds),
+    [{N, U} || {_, [{N, U}]} <- maps:to_list(ByName)].
+
+server_dirs(Dir) ->
+    case prim_file:list_dir(Dir) of
+        {ok, Names} ->
+            [Sub || Name <- Names,
+                    Sub <- [filename:join(Dir, Name)],
+                    filelib:is_dir(Sub)];
+        _ ->
+            []
+    end.
+
+%% A live WAL process means the system is running and its stored config is in
+%% force. `ra_system:fetch/1` alone cannot say: only
+%% `ra_systems_sup:stop_system/1` erases the `persistent_term`, so an `ra`
+%% application restart leaves the config of a system whose processes are gone.
+%% A system that stops between the two reads as not running and falls through to
+%% `ra_system:start/1`, which is what it needs anyway.
+running_config(System) ->
+    #{wal := Wal} = ra_system:derive_names(System),
+    case whereis(Wal) of
+        undefined -> undefined;
+        _Pid -> ra_system:fetch(System)
+    end.
+
+%% Log as well as return it: the condition is terminal and callers that discard
+%% the return would have nothing to go on.
+configs_agree(System, Want, Running) ->
+    case config_mismatch(Want, Running) of
+        Empty when map_size(Empty) =:= 0 ->
+            ok;
+        Mismatch ->
+            logger:error("portunus: Ra system ~p is already running with a "
+                         "configuration other than the one asked for: ~p",
+                         [System, Mismatch]),
+            {error, {ra_system_mismatch, System, Mismatch}}
+    end.
+
+%% `#{Key => {Wanted, Running}}` for each key that disagrees, empty when they
+%% agree. The directories decide where committed entries land;
+%% `server_recovery_strategy` decides whether this node's replicas come back at
+%% all, and a system portunus did not start also misses the registration repair
+%% `ensure_system_started/2` runs.
+-spec config_mismatch(ra_system:config(), ra_system:config()) ->
+    #{data_dir | wal_data_dir | server_recovery_strategy => {term(), term()}}.
+config_mismatch(Want, Running) ->
+    maps:from_list(
+      [{Key, {W, R}}
+       || {Key, W, R} <- [{data_dir, norm(maps:get(data_dir, Want)),
+                                     norm(maps:get(data_dir, Running))},
+                          {wal_data_dir, norm(wal_dir(Want)),
+                                         norm(wal_dir(Running))},
+                          %% Not a path, so compared as given.
+                          {server_recovery_strategy,
+                           maps:get(server_recovery_strategy, Want, undefined),
+                           maps:get(server_recovery_strategy, Running, undefined)}],
+          W =/= R]).
+
+%% Mirror `ra_log_sup:make_wal_conf/1`: an absent `wal_data_dir` means the WAL
+%% goes to `data_dir`, so omitting the key is not a mismatch.
+wal_dir(Config) ->
+    maps:get(wal_data_dir, Config, maps:get(data_dir, Config)).
+
+%% `data_dir` is a `file:filename_all()`, so one directory can arrive as a string
+%% or a binary, relative or absolute; Ra resolves relative ones against the
+%% node's working directory. The running config is not ours, so a value that is
+%% not a filename compares unequal rather than raising.
+norm(Dir) ->
+    try unicode:characters_to_list(Dir) of
+        Str when is_list(Str) -> filename:absname(filename:join([Str]));
+        _ -> Dir
+    catch
+        _:_ -> Dir
     end.
 
 %% Map a `supervisor:startchild_ret()` to ok: a freshly started system, an
@@ -366,7 +525,7 @@ join_or_form(System, Name, Members) when is_list(Members), Members =/= [] ->
     Seed = effective_seed(Members),
     case restart_server(System, Name) of
         ok ->
-            converge(System, Name, Seed);
+            converge(System, Name, Seed, Members);
         {error, name_not_registered} when node() =:= Seed ->
             form_or_join_existing(System, Name, Members);
         {error, name_not_registered} ->
@@ -393,22 +552,39 @@ is_reachable(Node) ->
 %% Form only when no reachable member runs a cluster, so a returning lowest node
 %% joins it rather than form a rival the merge would wipe.
 form_or_join_existing(System, Name, Members) ->
-    Others = [N || N <- lists:sort(Members), N =/= node(), is_reachable(N)],
-    case lists:search(fun(N) -> has_cluster(Name, N) end, Others) of
-        {value, Peer} ->
+    case [N || {N, {cluster, _}} <- peer_views(Name, Members)] of
+        [Peer | _] ->
             join_cluster(System, Name, Peer);
-        false ->
+        [] ->
             case start_cluster(System, Name, [node()]) of
                 {ok, _, _} -> ok;
                 {error, _} = Err -> Err
             end
     end.
 
-has_cluster(Name, Node) ->
-    case ra:members({Name, Node}, ?CMD_TIMEOUT) of
-        {ok, _, _} -> true;
-        _ -> false
+%% One peer's own view of its membership. `{local, ...}` is answered by that
+%% replica and never redirected, so a cluster holding an election still answers,
+%% where `ra:members/2` on the leader would time out exactly when no leader is
+%% the thing being decided.
+peer_view(Name, Peer) ->
+    case ra:members({local, {Name, Peer}}, ?CMD_TIMEOUT) of
+        {ok, [{Name, Peer}], _} -> solo;
+        {ok, Ms, _} -> {cluster, Ms};
+        _ -> none
     end.
+
+peer_views(Name, Members) ->
+    peer_views(Members, fun is_reachable/1, fun(N) -> peer_view(Name, N) end).
+
+%% The reachable peers' views, in sorted order, so every call site picks the same
+%% peer. Deduplicated: a repeated member would otherwise be probed twice, at
+%% `?CMD_TIMEOUT` each when it is unreachable.
+-spec peer_views([node()], fun((node()) -> boolean()),
+                 fun((node()) -> solo | {cluster, [server_id()]} | none)) ->
+    [{node(), solo | {cluster, [server_id()]} | none}].
+peer_views(Members, IsReachable, PeerView) ->
+    [{N, PeerView(N)} || N <- lists:usort(Members),
+                         N =/= node(), IsReachable(N)].
 
 %% Forces "orphan" members to rejoin their seed; a member already with the seed is
 %% left alone.
@@ -416,34 +592,54 @@ has_cluster(Name, Node) ->
 %% This function is needed during initial cluster formation because members can be
 %% started in parallel. It has no effect on members that have already rejoined
 %% their cluster (seed).
-converge(System, Name, Seed) ->
+converge(System, Name, Seed, Members) ->
     ServerId = {Name, node()},
     case ra:members({local, ServerId}, ?CMD_TIMEOUT) of
-        {ok, [ServerId], _Leader} when node() =:= Seed ->
-            %% Sole-member seed recovered leaderless with an empty log (formed,
-            %% then restarted before committing): elect it regardless of
-            %% `has_log_entries/1`, which is false here and would misroute to
-            %% `join_cluster/3` against a leaderless local replica.
-            maybe_trigger_single_member_election(ServerId, [ServerId]),
-            ok;
-        {ok, Members, _Leader} ->
-            case lists:member(ServerId, Members) andalso has_log_entries(ServerId) of
-                true when node() =:= Seed ->
-                    maybe_trigger_single_member_election(ServerId, Members),
+        {ok, LocalMembers, _Leader} ->
+            %% Two separate questions. An empty log is either genesis or a lost
+            %% log, and only the peers can say which. A log that does not carry
+            %% this node as a member is committed knowledge that it was removed.
+            case {has_log_entries(ServerId), lists:member(ServerId, LocalMembers)} of
+                {false, _} when node() =:= Seed ->
+                    elect_or_join(System, Name, Members, ServerId, LocalMembers);
+                {false, _} ->
+                    join_cluster(System, Name, Seed);
+                {true, false} ->
+                    join_cluster(System, Name, Seed);
+                {true, true} when node() =:= Seed ->
+                    maybe_trigger_single_member_election(ServerId, LocalMembers),
                     ok;
-                true ->
-                    case lists:member({Name, Seed}, Members) of
+                {true, true} ->
+                    case lists:member({Name, Seed}, LocalMembers) of
                         true -> ok;
                         false -> merge_into_seed(System, Name, Seed, ServerId)
-                    end;
-                false ->
-                    join_cluster(System, Name, Seed)
+                    end
             end;
         _ ->
             %% Local query timed out. Retry rather than joining "as is", so a
             %% "seedless" member is not added without the reset `merge_into_seed/4`
             %% applies to it.
             {error, local_view_unavailable}
+    end.
+
+%% An empty log carries no cluster configuration, so the local view falls back to
+%% the persisted `initial_members`, which is `[Self]` for every server
+%% `join_or_form/3` created. Electing on that alone mints a term with quorum 1 and
+%% no RPC leaving the node, against a live leader. Only the peers can tell genesis
+%% from a lost log, so ask them first.
+elect_or_join(System, Name, Members, ServerId, LocalMembers) ->
+    case [{N, Ms} || {N, {cluster, Ms}} <- peer_views(Name, Members)] of
+        [] ->
+            %% No peer runs a multi-member cluster: genesis, every peer solo, or
+            %% every peer configless. All three want this node to form, and the
+            %% merge pulls the solo peers in. `LocalMembers` rather than
+            %% `[ServerId]`, so a view that is not sole-member does not elect.
+            maybe_trigger_single_member_election(ServerId, LocalMembers);
+        [{Peer, Ms} | _] ->
+            case lists:member(ServerId, Ms) of
+                true -> ok;
+                false -> join_cluster(System, Name, Peer)
+            end
     end.
 
 %% Asks the seed if given node is its cluster member. If not,
