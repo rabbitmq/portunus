@@ -58,7 +58,7 @@ target any member's replica (`reset_server/2`).
 -export([settle_timed_out_bid/3]).
 
 %% Exported (undocumented) so seed selection is testable with a supplied predicate.
--export([effective_seed/2]).
+-export([effective_seed/1, effective_seed/2]).
 
 -include("portunus.hrl").
 
