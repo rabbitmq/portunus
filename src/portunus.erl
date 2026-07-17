@@ -16,6 +16,7 @@ target any member's replica (`reset_server/2`).
 
 %% Cluster lifecycle.
 -export([start_system/2,
+         use_system/1,
          ensure_started/1,
          start_cluster/3,
          join_cluster/3,
@@ -25,7 +26,9 @@ target any member's replica (`reset_server/2`).
          add_member/2,
          remove_member/2,
          reset_server/2,
-         members/1]).
+         members/1,
+         orphaned_replicas/1,
+         delete_orphaned_replica/2]).
 
 %% Leases.
 -export([grant_lease/2, grant_lease/3,
@@ -48,7 +51,8 @@ target any member's replica (`reset_server/2`).
 -export([watch/2, unwatch/2]).
 
 %% Health and introspection.
--export([has_quorum/1, is_member/1, status/1]).
+-export([has_quorum/1, is_member/1, is_seed_cluster_member/2, status/1,
+         token_info/1]).
 
 %% Conveniences.
 -export([lock/3, unlock/1, with_lock/4]).
@@ -63,6 +67,10 @@ target any member's replica (`reset_server/2`).
 %% Exported (undocumented) so the Ra system config comparison is testable without
 %% a running system, and the peers' views without a cluster.
 -export([config_mismatch/2, peer_views/3]).
+
+%% Exported (undocumented) so the rejoin decision is testable as a pure
+%% function and the registration flush is exercisable without a lifecycle call.
+-export([rejoin_action/2, sync_registration/1]).
 
 -include("portunus.hrl").
 
@@ -88,7 +96,7 @@ target any member's replica (`reset_server/2`).
                              context => term()}.
 
 %% A watch registration handle from `watch/2`, passed to `unwatch/2` to stop watching.
-%% Current Raft indices are used as watch references.
+%% Epoch-packed Raft indices are used as watch references.
 -type watch_ref() :: portunus_machine:watch_ref().
 
 %% `grant_lease/3` options: `auto_renew` attaches a holder-linked renewer
@@ -181,6 +189,43 @@ start_system(System, DataDir) ->
     else
         {error, _} = Err -> Err
     end.
+
+-doc """
+Use a running Ra system that the embedding application started and owns, such
+as RabbitMQ's `coordination` system, instead of one started with
+`start_system/2`.
+
+`portunus` becomes a tenant: it never starts, stops or reconfigures the
+system, and the registration repair `start_system/2` performs cannot run,
+since the host recovers the system before any `portunus` code exists. The
+host needs no `server_recovery_strategy`: the caller re-running
+`join_or_form/3` is the recovery mechanism, and a member whose registration
+was lost anyway rejoins as a new member (see `join_or_form/3`).
+
+Returns `{error, {ra_system_not_running, System}}` when the system is not
+running: retryable, unlike `start_system/2`'s terminal `ra_system_mismatch`.
+
+The host must own its data and WAL directories exclusively, keep them on
+persistent storage, and never delete subdirectories it does not recognise:
+tenant replicas live there, named by UID.
+""".
+-spec use_system(system()) -> ok_or_error(term()).
+use_system(System) ->
+    maybe
+        {ok, _} ?= application:ensure_all_started(ra),
+        {ok, _} ?= application:ensure_all_started(seshat),
+        {ok, _} ?= application:ensure_all_started(portunus),
+        {ok, Config} ?= fetch_running(System),
+        logger:info("portunus: using Ra system ~p with data dir ~ts "
+                    "and WAL dir ~ts",
+                    [System, maps:get(data_dir, Config), wal_dir(Config)]),
+        ok
+    else
+        {error, _} = Err -> Err
+    end.
+
+wal_running(#{wal := Wal}) ->
+    is_pid(whereis(Wal)).
 
 %% A system portunus did not start never sees `Config`, so refuse one that
 %% disagrees with it rather than run against it. Compare before
@@ -279,16 +324,31 @@ server_dirs(Dir) ->
     end.
 
 %% A live WAL process means the system is running and its stored config is in
-%% force. `ra_system:fetch/1` alone cannot say: only
+%% force. The WAL name comes from the fetched config, not `derive_names/1`: a
+%% host names its processes freely, and a running host with underived names
+%% must reach the mismatch comparison rather than have its stored config
+%% silently overwritten (`ra_systems_sup:start_system/1` stores before it
+%% checks the child). A system that stops between the two reads as not running
+%% and falls through to `ra_system:start/1`, which is what it needs anyway.
+running_config(System) ->
+    case fetch_running(System) of
+        {ok, Config} -> Config;
+        {error, _} -> undefined
+    end.
+
+%% The fetched config of a running system, or `use_system/1`'s retryable
+%% not-running error. `ra_system:fetch/1` alone cannot say: only
 %% `ra_systems_sup:stop_system/1` erases the `persistent_term`, so an `ra`
 %% application restart leaves the config of a system whose processes are gone.
-%% A system that stops between the two reads as not running and falls through to
-%% `ra_system:start/1`, which is what it needs anyway.
-running_config(System) ->
-    #{wal := Wal} = ra_system:derive_names(System),
-    case whereis(Wal) of
-        undefined -> undefined;
-        _Pid -> ra_system:fetch(System)
+fetch_running(System) ->
+    case ra_system:fetch(System) of
+        #{names := Names} = Config ->
+            case wal_running(Names) of
+                true -> {ok, Config};
+                false -> {error, {ra_system_not_running, System}}
+            end;
+        undefined ->
+            {error, {ra_system_not_running, System}}
     end.
 
 %% Log as well as return it: the condition is terminal and callers that discard
@@ -384,9 +444,42 @@ start_cluster(System, Name, Nodes) ->
     case ensure_name_unregistered(System, Name) of
         ok ->
             ServerIds = [{Name, N} || N <- Nodes],
-            ra:start_cluster(System, Name, machine(Name), ServerIds);
+            case ra:start_cluster(System, Name, machine(Name), ServerIds) of
+                {ok, Started, _} = Ok ->
+                    flush_registrations(System, Started),
+                    Ok;
+                Other ->
+                    Other
+            end;
         {error, _} = Err ->
             Err
+    end.
+
+%% `ra:start_cluster/4` wrote a registration on every node it started a
+%% server on, and the sync is a local DETS flush, so run it wherever a write
+%% landed. Best-effort like the sync itself: an unreachable node keeps
+%% exactly the auto-save window.
+flush_registrations(System, Started) ->
+    ok = sync_registration(System),
+    _ = [rpc:call(Node, portunus, sync_registration, [System])
+         || {_, Node} <- Started, Node =/= node()],
+    ok.
+
+%% A registration is a DETS write in Ra's 500 ms auto-save buffer; a hard kill
+%% loses it while the replica's directory survives. Flush after every write.
+%% The table name comes from the fetched config (a host may not use derived
+%% names). A failed flush leaves exactly today's window, so errors are ignored.
+-spec sync_registration(system()) -> ok.
+sync_registration(System) ->
+    case ra_system:fetch(System) of
+        #{names := #{directory_rev := Rev}} ->
+            try dets:sync(Rev) of
+                _ -> ok
+            catch
+                _:_ -> ok
+            end;
+        _ ->
+            ok
     end.
 
 -doc """
@@ -406,18 +499,100 @@ join_cluster(System, Name, SeedNode) ->
     end.
 
 join_cluster1(System, Name, SeedNode) ->
-    case ra:members({Name, SeedNode}, ?CMD_TIMEOUT) of
-        {ok, Members, Leader} ->
+    join_cluster1(System, Name, SeedNode, _EvictBudget = 1).
+
+join_cluster1(System, Name, SeedNode, EvictBudget) ->
+    case {ra:members({Name, SeedNode}, ?CMD_TIMEOUT), locally_known(System, Name)} of
+        {_, unavailable} ->
+            %% The local directory cannot be read (the system is stopping or
+            %% mid-restart): retry rather than mistake it for "never a member"
+            %% and evict an intact identity.
+            {error, local_view_unavailable};
+        {{ok, Members, Leader}, Known} ->
             ServerId = {Name, node()},
-            case lists:member(ServerId, Members) of
-                true ->
-                    ok;
-                false ->
+            case rejoin_action(Known, lists:member(ServerId, Members)) of
+                restart ->
+                    bring_up_local_server(System, Name);
+                evict_then_join when EvictBudget > 0 ->
+                    evict_then_join(System, Name, SeedNode, Leader, ServerId,
+                                    EvictBudget - 1);
+                evict_then_join ->
+                    %% Evicted once and still listed: the change is in flight
+                    %% (or leadership is churning); retry on the next pass
+                    %% rather than loop inside one call.
+                    {error, membership_change_pending};
+                join ->
                     case ensure_local_server(System, Name, ServerId, Members) of
                         ok -> add_self(Leader, ServerId);
                         {error, _} = Err -> Err
                     end
             end;
+        {{timeout, _} = T, _} ->
+            {error, T};
+        {{error, _} = Err, _} ->
+            Err
+    end.
+
+%% Three-valued on purpose: `false` (no recoverable local identity) warrants
+%% an evict where `unavailable` (the directory itself cannot be read) only
+%% warrants a retry. A registration alone is not proof:
+%% `ra:force_delete_server/2` deletes the replica directory before it
+%% unregisters the name, so a kill inside the call leaves a name pointing at
+%% a directory that is gone, and `ra` can never restart that server. The
+%% predicate is the readable `config` file (what `ra`'s own `recover_config/2`
+%% needs), not the bare directory: a kill inside `ra`'s recursive delete can
+%% leave an empty directory behind.
+locally_known(System, Name) ->
+    try ra_directory:uid_of(System, Name) of
+        UId when is_binary(UId) ->
+            Dir = ra_env:server_data_dir(System, UId),
+            case ra_log:read_config(Dir) of
+                {ok, _} -> true;
+                {error, _} -> false
+            end;
+        _ ->
+            false
+    catch
+        _:_ -> unavailable
+    end.
+
+%% What the seed's member list means, given whether the local Ra directory
+%% knows the server. A bare `ok` for every listed member (the old behaviour)
+%% left a node whose local identity was lost looping against a cluster that
+%% remembers it.
+-type rejoin_action() :: restart | join | evict_then_join.
+-spec rejoin_action(LocallyKnown :: boolean(), ListedAsMember :: boolean()) ->
+    rejoin_action().
+rejoin_action(true, true) -> restart;
+rejoin_action(false, true) -> evict_then_join;
+rejoin_action(_, false) -> join.
+
+%% Known locally: the server is at most stopped, so bring it up.
+bring_up_local_server(System, Name) ->
+    case whereis(Name) of
+        undefined -> restart_server(System, Name);
+        _ -> ok
+    end.
+
+%% The cluster remembers a member whose local identity (registration or disk)
+%% is gone. A fresh server under the remembered identity could vote twice in a
+%% term the lost `meta.dets` already voted in, so remove it and rejoin as a
+%% new member. The removal needs an elected leader, and any quorum that
+%% elected one holds every committed entry, so nothing committed is lost.
+evict_then_join(System, Name, SeedNode, Leader, ServerId, EvictBudget) ->
+    logger:warning("portunus: cluster ~p lists ~p as a member but this node "
+                   "has no local identity for it; removing the remembered "
+                   "member and rejoining as a new one. A previous replica's "
+                   "data directory may remain on disk: "
+                   "portunus:orphaned_replicas/1 lists such directories and "
+                   "portunus:delete_orphaned_replica/2 removes one.",
+                   [Name, node()]),
+    case ra:remove_member(Leader, ServerId) of
+        {ok, _, _} ->
+            join_cluster1(System, Name, SeedNode, EvictBudget);
+        %% Removed by a concurrent pass: proceed to the ordinary join.
+        {error, not_member} ->
+            join_cluster1(System, Name, SeedNode, EvictBudget);
         {timeout, _} = T ->
             {error, T};
         {error, _} = Err ->
@@ -427,17 +602,25 @@ join_cluster1(System, Name, SeedNode) ->
 %% A server left by an earlier join attempt whose `add_member` failed (a
 %% concurrent join, a leader-change timeout) is fine: proceed to the
 %% idempotent `add_member`, or every later retry wedges on `already_started`.
-%% `ra_directory` decides "exists locally"; matching `ra:start_server`'s
-%% error shapes would tie this to supervisor internals.
+%% `locally_known/2` decides "exists locally"; matching `ra:start_server`'s
+%% error shapes would tie this to supervisor internals, and a registration
+%% whose replica directory is gone must start a new server (minting a fresh
+%% UID and overwriting the stale registration), not restart a name `ra`
+%% cannot recover.
 ensure_local_server(System, Name, ServerId, Members) ->
-    case is_ra_server(System, Name) of
+    case locally_known(System, Name) of
         true ->
-            case whereis(Name) of
-                undefined -> restart_server(System, Name);
-                _ -> ok
-            end;
+            bring_up_local_server(System, Name);
         false ->
-            ra:start_server(System, Name, ServerId, machine(Name), Members)
+            case ra:start_server(System, Name, ServerId, machine(Name), Members) of
+                ok ->
+                    ok = sync_registration(System),
+                    ok;
+                Err ->
+                    Err
+            end;
+        unavailable ->
+            {error, local_view_unavailable}
     end.
 
 add_self(Leader, ServerId) ->
@@ -462,6 +645,9 @@ reset_and_join_cluster(System, Name, SeedNode) ->
     ServerId = {Name, node()},
     _ = ra:stop_server(System, ServerId),
     _ = ra:force_delete_server(System, ServerId),
+    %% A kill between the buffered delete and the rejoin's insert is the
+    %% lost-registration window; flush the delete first.
+    ok = sync_registration(System),
     join_cluster(System, Name, SeedNode).
 
 -doc """
@@ -523,15 +709,23 @@ reset the local member.
 -spec join_or_form(system(), name(), [node()]) -> ok_or_error(term()).
 join_or_form(System, Name, Members) when is_list(Members), Members =/= [] ->
     Seed = effective_seed(Members),
-    case restart_server(System, Name) of
-        ok ->
-            converge(System, Name, Seed, Members);
-        {error, name_not_registered} when node() =:= Seed ->
+    %% The restart is attempted only for an identity `ra` can recover. A
+    %% registration whose replica directory is gone (a kill inside
+    %% `ra:force_delete_server/2`) would fail the restart the same way on
+    %% every pass; only the join path can evict the remembered member and
+    %% re-admit this node as a new one.
+    case locally_known(System, Name) of
+        true ->
+            case restart_server(System, Name) of
+                ok -> converge(System, Name, Seed, Members);
+                {error, _} = Err -> Err
+            end;
+        false when node() =:= Seed ->
             form_or_join_existing(System, Name, Members);
-        {error, name_not_registered} ->
+        false ->
             join_cluster(System, Name, Seed);
-        {error, _} = Err ->
-            Err
+        unavailable ->
+            {error, local_view_unavailable}
     end.
 
 -spec effective_seed([node()]) -> node().
@@ -705,6 +899,7 @@ reset_server(System, {Name, _Node} = ServerId) ->
                 false ->
                     _ = ra:stop_server(System, ServerId),
                     _ = ra:force_delete_server(System, ServerId),
+                    ok = sync_registration(System),
                     ok
             end;
         _ ->
@@ -722,6 +917,95 @@ members(Name) ->
         {error, _} = Err -> Err
     end.
 
+-doc """
+This node's replica directories that belong to `portunus` machines but have
+no registration: what the evict-then-rejoin path and a single-node
+re-formation leave behind. Local-node only, and the system must be running
+(the registration lookup reads its directory table): a stopped system
+returns `use_system/1`'s retryable error.
+
+On a hosted system the data directory is shared with other tenants; a
+directory whose `config` names another machine module is never listed, so
+the answer contains only what is `portunus`'s to name.
+""".
+-spec orphaned_replicas(system()) ->
+    {ok, [#{name := name(), uid := binary(), dir := file:filename_all()}]} |
+    {error, {ra_system_not_running, system()}}.
+orphaned_replicas(System) ->
+    case fetch_running(System) of
+        {ok, #{data_dir := Dir}} ->
+            try
+                {ok, [#{name => Name, uid => UId, dir => Sub}
+                      || {Name, UId, Sub} <- local_portunus_replicas(Dir),
+                         ra_directory:uid_of(System, Name) =/= UId]}
+            catch
+                %% The system stopped mid-scan and the directory table is gone.
+                _:_ -> {error, {ra_system_not_running, System}}
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc """
+Delete the directory of an orphan listed by `orphaned_replicas/1`, by UID.
+A UID that is still registered is refused as `registered`. A directory that
+is missing, unreadable, another node's, or another tenant's reads as
+`not_found` on purpose: it is not `portunus`'s to name, let alone delete.
+""".
+-spec delete_orphaned_replica(system(), binary()) ->
+    ok | {error, registered | not_found |
+                 {ra_system_not_running, system()} | file:posix()}.
+delete_orphaned_replica(System, UId) when is_binary(UId) ->
+    case fetch_running(System) of
+        {ok, _} ->
+            try delete_orphaned_replica1(System, UId)
+            catch
+                _:_ -> {error, {ra_system_not_running, System}}
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+delete_orphaned_replica1(System, UId) ->
+    Dir = ra_env:server_data_dir(System, UId),
+    case ra_log:read_config(Dir) of
+        {ok, Config} ->
+            case portunus_replica_identity(Config) of
+                {_Name, UId} ->
+                    case ra_directory:is_registered_uid(System, UId) of
+                        true -> {error, registered};
+                        false -> file:del_dir_r(Dir)
+                    end;
+                _ ->
+                    {error, not_found}
+            end;
+        {error, _} ->
+            {error, not_found}
+    end.
+
+%% This node's `portunus` replicas, read from the `config` files under the
+%% system's data directory (the artefact the `repair_registrations/1` pass
+%% trusts). The machine-module check is the tenant filter: on a hosted system
+%% the directory is shared, and only each tenant can say which UID
+%% directories are its own.
+local_portunus_replicas(Dir) ->
+    [{Name, UId, Sub}
+     || Sub <- server_dirs(Dir),
+        {ok, C} <- [ra_log:read_config(Sub)],
+        {Name, UId} <- [portunus_replica_identity(C)]].
+
+%% `{Name, UId}` when a replica `config` names one of this node's `portunus`
+%% machines; `undefined` otherwise (a comprehension generator skips it).
+portunus_replica_identity(Config) ->
+    case Config of
+        #{id := {Name, Node}, uid := UId,
+          machine := {module, portunus_machine, _}}
+          when Node =:= node(), is_binary(UId) ->
+            {Name, UId};
+        _ ->
+            undefined
+    end.
+
 %%----------------------------------------------------------------------
 %% Leases
 %%----------------------------------------------------------------------
@@ -737,9 +1021,9 @@ holder-linked renewer keeps it alive for as long as the calling process
 lives; the lease (and any locks held under it) ends when the caller dies
 or revokes. The returned id is used exactly like any other. A
 `proposed_id` makes the grant idempotent under retry; without one the id
-is auto-assigned. Auto-assigned ids are integers (Raft indices), so an
-integer `proposed_id` can collide with them and draw a spurious
-`id_in_use`; propose a tuple or any other non-integer term.
+is auto-assigned. Auto-assigned ids are integers (epoch-packed Raft
+indices), so an integer `proposed_id` can collide with them and draw a
+spurious `id_in_use`; propose a tuple or any other non-integer term.
 
 A holder that revokes an auto-renewed lease receives one final
 `{portunus, lease_lost, LeaseId}` when the renewer discovers the
@@ -1067,6 +1351,36 @@ has_log_entries(ServerId) ->
     KM = try ra:key_metrics(ServerId) catch _:_ -> #{} end,
     maps:get(last_index, KM, 0) > 0.
 
+-doc """
+Whether this node is a member of the cluster the effective seed belongs to:
+the gate for a consumer's reconcile pass over a cluster bootstrapped with
+`join_or_form/3`. `Candidates` is the same node list `join_or_form/3` takes
+and must include this node.
+
+The membership question must be asked about the node `join_or_form/3` picks:
+asking the lowest candidate instead means no node ever passes the gate while
+that candidate is down. This function carries that invariant, so callers do
+not re-derive it. Any error reads as `false`: "not confirmed" and "not
+joined" gate identically.
+""".
+-spec is_seed_cluster_member(name(), [node()]) -> boolean().
+is_seed_cluster_member(Name, Candidates) when is_list(Candidates), Candidates =/= [] ->
+    try
+        case effective_seed(Candidates) of
+            Seed when Seed =:= node() ->
+                is_member(Name);
+            Seed ->
+                %% The seed replica's own view (`local`, never redirected), so
+                %% the gate still answers during an election.
+                case ra:members({local, {Name, Seed}}, ?CMD_TIMEOUT) of
+                    {ok, Members, _} -> lists:member({Name, node()}, Members);
+                    _ -> false
+                end
+        end
+    catch
+        _:_ -> false
+    end.
+
 -doc "A snapshot of cluster health and the machine-derived counts.".
 -spec status(name()) -> status().
 status(Name) ->
@@ -1083,6 +1397,18 @@ status(Name) ->
     Base#{leader => Leader,
           members => Members,
           quorum => Quorum}.
+
+-doc """
+Decompose a fencing token (or an auto-assigned lease id, or a watch
+reference) into its epoch and index parts, for logging and debugging. The
+epoch distinguishes cluster incarnations; within one incarnation tokens
+order by index. An epoch of `0` means the identifier was minted before the
+incarnation had a stamp.
+""".
+-spec token_info(token()) ->
+    #{epoch := non_neg_integer(), index := non_neg_integer()}.
+token_info(Token) ->
+    portunus_machine:token_info(Token).
 
 %%----------------------------------------------------------------------
 %% Conveniences

@@ -27,9 +27,12 @@
          start/3, start/4, stop/1,
          start_node/2, mesh/1, data_dir/2, await_registered/3,
          wait_leader/2, cluster_info/2, member_count/2,
-         stop_ra_server/2, restart_ra_server/2, restart_ra_system/2,
+         stop_ra_server/2, stop_ra_server/3,
+         restart_ra_server/2, restart_ra_system/2,
+         start_host_system/2, restart_host_system/3,
+         cold_registration_lookup/2,
          start_client/1, ccall/3, until_quorum/3, until_quorum/4,
-         converge_all/3, place_lock/3,
+         converge_all/3, converge_all/4, place_lock/3,
          await_owner/3, await_owner/4, await_owner/5, await_released/3,
          wait_until/1, wait_until/2]).
 %% Spawned on the peer nodes, so it must be exported.
@@ -105,7 +108,8 @@ stop(_) ->
 
 %% Start one peer node carrying the runner's code path, with its own data dir,
 %% portunus loaded and its system started. `Opts` may set `name_prefix`,
-%% `tick_ms`, and `env` (extra portunus application env pairs).
+%% `tick_ms`, `env` (extra portunus application env pairs), and
+%% `hosted => System` for a host-owned Ra system attached with `use_system/1`.
 -spec start_node([{atom(), term()}], map()) -> {peer:server_ref(), node()}.
 start_node(Config, Opts) ->
     Prefix = maps:get(name_prefix, Opts, "portunus_node"),
@@ -120,8 +124,50 @@ start_node(Config, Opts) ->
     ok = rpc:call(Node, application, set_env, [portunus, tick_interval_ms, TickMs]),
     _ = [ok = rpc:call(Node, application, set_env, [portunus, K, V])
          || {K, V} <- maps:get(env, Opts, [])],
-    ok = rpc:call(Node, portunus, start_system, [?SYS, DataDir]),
+    case Opts of
+        #{hosted := System} ->
+            ok = rpc:call(Node, ?MODULE, start_host_system, [System, DataDir]),
+            ok = rpc:call(Node, portunus, use_system, [System]);
+        _ ->
+            ok = rpc:call(Node, portunus, start_system, [?SYS, DataDir])
+    end,
     {Peer, Node}.
+
+%% A host-style Ra system: both path keys to one directory, derived names, no
+%% `server_recovery_strategy`. Runs on the node whose system it is.
+-spec start_host_system(atom(), file:filename_all()) -> ok.
+start_host_system(System, DataDir) ->
+    {ok, _} = application:ensure_all_started(ra),
+    Config0 = maps:remove(server_recovery_strategy, ra_system:default_config()),
+    Config = Config0#{name => System,
+                      data_dir => DataDir,
+                      wal_data_dir => DataDir,
+                      names => ra_system:derive_names(System)},
+    case ra_system:start(Config) of
+        {ok, _} -> ok;
+        {error, {already_started, _}} -> ok
+    end.
+
+%% `restart_ra_system/2` for a host-owned system: no recovery strategy runs,
+%% so no replica comes back until a caller re-runs its bootstrap.
+-spec restart_host_system([{atom(), term()}], node(), atom()) -> ok.
+restart_host_system(Config, Node, System) ->
+    ok = rpc:call(Node, ra_system, stop, [System]),
+    ok = rpc:call(Node, ?MODULE, start_host_system,
+                  [System, data_dir(Config, Node)]),
+    ok = rpc:call(Node, portunus, use_system, [System]).
+
+%% Copy `names.dets` aside without closing it and open the copy cold: the copy
+%% holds exactly what a kill at that instant would have left on disk.
+-spec cold_registration_lookup(file:filename_all(), atom()) -> [tuple()].
+cold_registration_lookup(Dir, Name) ->
+    Copy = filename:join(Dir, "names_cold_copy.dets"),
+    {ok, _} = file:copy(filename:join(Dir, "names.dets"), Copy),
+    {ok, Tab} = dets:open_file(cold_names_copy, [{file, Copy}]),
+    Entries = dets:lookup(Tab, Name),
+    ok = dets:close(Tab),
+    ok = file:delete(Copy),
+    Entries.
 
 mesh(Nodes) ->
     _ = [[pong = rpc:call(A, net_adm, ping, [B]) || B <- Nodes, B =/= A]
@@ -143,7 +189,11 @@ await_registered(Node, System, Name) ->
 
 -spec stop_ra_server(node(), atom()) -> ok.
 stop_ra_server(Node, Name) ->
-    ok = rpc:call(Node, ra, stop_server, [?SYS, {Name, Node}]).
+    stop_ra_server(Node, ?SYS, Name).
+
+-spec stop_ra_server(node(), atom(), atom()) -> ok.
+stop_ra_server(Node, System, Name) ->
+    ok = rpc:call(Node, ra, stop_server, [System, {Name, Node}]).
 
 -spec restart_ra_server(node(), atom()) -> ok.
 restart_ra_server(Node, Name) ->
@@ -166,9 +216,13 @@ data_dir(Config, Node) ->
 %% `join_or_form/3` on every live node each round until all are one cluster.
 -spec converge_all([node()], [node()], atom()) -> ok.
 converge_all(Members, LiveNodes, Name) ->
+    converge_all(?SYS, Members, LiveNodes, Name).
+
+-spec converge_all(atom(), [node()], [node()], atom()) -> ok.
+converge_all(System, Members, LiveNodes, Name) ->
     wait_until(fun() ->
                        _ = [rpc:call(N, portunus, join_or_form,
-                                     [?SYS, Name, Members]) || N <- LiveNodes],
+                                     [System, Name, Members]) || N <- LiveNodes],
                        member_count(LiveNodes, Name) =:= length(LiveNodes)
                end).
 

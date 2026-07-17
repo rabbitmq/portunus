@@ -18,7 +18,10 @@ owner starts that child under a local Erlang/OTP supervisor.
 
 `remove/2` stops the local election; the child is gone cluster-wide once every node that
 added it calls `remove/2`, and a `remove/2` on the owner alone moves the
-child to another node.
+child to another node. `sync/2` reconciles the whole set in one call: a
+consumer that mirrors an external source of truth should use it, because
+an add-only reconcile resurrects deleted children on a node that was
+offline at delete time.
 
 No new replicated state: the registry holds only local election pids and
 a local supervisor. Restart is local and per-child, with one exception: a
@@ -37,7 +40,7 @@ supervising it should give it a generous `shutdown` value.
 %% `supervisor:start_child/2` on the local supervisor.
 -behaviour(portunus_election).
 
--export([start_link/2, start_link/3, add/2, add/3, remove/2, keys/1,
+-export([start_link/2, start_link/3, add/2, add/3, remove/2, sync/2, keys/1,
          owned_keys/1, which_children/1, transfer/3, stop/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 %% portunus_election callbacks
@@ -130,6 +133,25 @@ it on the owner alone moves the child to another contender.
 remove(Server, Key) ->
     gen_server:call(Server, {remove, Key}, infinity).
 
+-doc """
+Make this node's registrations equal `ChildSpecs`, keyed by child id: specs
+whose id is missing are added, registrations whose id is absent from the
+set are removed (with `remove/2`'s semantics: this node stops contending,
+and ownership of a currently-owned key moves), and a changed spec is
+applied as remove then add. An unchanged spec is untouched, so a second
+`sync/2` with the same set is a no-op and causes no ownership churn.
+Duplicate ids and invalid specs are refused before any change is applied.
+
+Built for reconciling children from an external source of truth: an
+add-only reconcile resurrects deleted children on a node that was offline
+at delete time. `sync/2` cannot fix a stale input; a node syncing from an
+outdated view of the source still registers what that view says.
+""".
+-spec sync(server(), [portunus_delayed_restart:child_spec_in()]) ->
+    ok | {error, add_error()}.
+sync(Server, ChildSpecs) when is_list(ChildSpecs) ->
+    gen_server:call(Server, {sync, ChildSpecs}, infinity).
+
 -doc "The keys this node is contending for.".
 -spec keys(server()) -> [term()].
 keys(Server) ->
@@ -181,36 +203,17 @@ init({Name, Opts}) ->
                 affinity = maps:get(affinity, Opts, default),
                 local_sup = LocalSup}}.
 
-handle_call({add, Key, ChildSpec}, _From,
-            #state{elections = Elections} = State) ->
-    case validate(Key, ChildSpec, Elections) of
-        ok ->
-            {ok, Pid} = start_election(Key, ChildSpec, State),
-            {reply, ok,
-             State#state{elections = Elections#{Key => {Pid, ChildSpec}}}};
-        idempotent ->
-            {reply, ok, State};
+handle_call({add, Key, ChildSpec}, _From, State) ->
+    {Reply, State1} = do_add(Key, ChildSpec, State),
+    {reply, Reply, State1};
+handle_call({remove, Key}, _From, State) ->
+    {reply, ok, do_remove(Key, State)};
+handle_call({sync, ChildSpecs}, _From, State) ->
+    case desired_set(ChildSpecs) of
+        {ok, Desired} ->
+            {reply, ok, do_sync(Desired, State)};
         {error, _} = Err ->
             {reply, Err, State}
-    end;
-handle_call({remove, Key}, _From, #state{elections = Elections,
-                                         local_sup = LocalSup} = State) ->
-    case maps:take(Key, Elections) of
-        {{Pid, Spec}, Rest} when is_pid(Pid) ->
-            %% Bounded: an election stuck in user callback code must not
-            %% wedge the registry and every caller queued behind it.
-            ok = portunus_election:stop_all([Pid], 5000),
-            %% A live election stopped its child in `stepped_down`; one that
-            %% just died could not, and its `'EXIT'` may still be queued
-            %% behind this call. Stopping by id is idempotent either way.
-            stop_local_child(LocalSup, child_id(Spec)),
-            {reply, ok, State#state{elections = Rest}};
-        {{restarting, Spec}, Rest} ->
-            %% Taking the entry cancels the pending restart.
-            stop_local_child(LocalSup, child_id(Spec)),
-            {reply, ok, State#state{elections = Rest}};
-        error ->
-            {reply, ok, State}
     end;
 handle_call(keys, _From, #state{elections = Elections} = State) ->
     {reply, maps:keys(Elections), State};
@@ -307,6 +310,72 @@ stop_local_child(LocalSup, ChildId) ->
     _ = supervisor:delete_child(LocalSup, ChildId),
     ok = portunus_delayed_restart:forget(LocalSup, ChildId).
 
+do_add(Key, ChildSpec, #state{elections = Elections} = State) ->
+    case validate(Key, ChildSpec, Elections) of
+        ok ->
+            {ok, Pid} = start_election(Key, ChildSpec, State),
+            {ok, State#state{elections = Elections#{Key => {Pid, ChildSpec}}}};
+        idempotent ->
+            {ok, State};
+        {error, _} = Err ->
+            {Err, State}
+    end.
+
+do_remove(Key, #state{elections = Elections, local_sup = LocalSup} = State) ->
+    case maps:take(Key, Elections) of
+        {{Pid, Spec}, Rest} when is_pid(Pid) ->
+            %% Bounded: an election stuck in user callback code must not
+            %% wedge the registry and every caller queued behind it.
+            ok = portunus_election:stop_all([Pid], 5000),
+            %% A live election stopped its child in `stepped_down`; one that
+            %% just died could not, and its `'EXIT'` may still be queued
+            %% behind this call. Stopping by id is idempotent either way.
+            stop_local_child(LocalSup, child_id(Spec)),
+            State#state{elections = Rest};
+        {{restarting, Spec}, Rest} ->
+            %% Taking the entry cancels the pending restart.
+            stop_local_child(LocalSup, child_id(Spec)),
+            State#state{elections = Rest};
+        error ->
+            State
+    end.
+
+%% Remove first (stale keys and changed specs), then add what is missing.
+%% Unchanged entries are never touched, which is what makes a repeated
+%% `sync/2` churn-free. Every spec was validated by `desired_set/1`, and
+%% after the removals every remaining key carries its unchanged desired
+%% spec, so the adds cannot fail.
+do_sync(Desired, #state{elections = Elections0} = State0) ->
+    Remove = [K || K := {_, Spec} <- Elections0,
+                   case Desired of
+                       #{K := Spec} -> false;
+                       _ -> true
+                   end],
+    State1 = lists:foldl(fun do_remove/2, State0, Remove),
+    Add = [K || K := _ <- Desired,
+                not is_map_key(K, State1#state.elections)],
+    lists:foldl(fun(K, S) ->
+                        {ok, S1} = do_add(K, maps:get(K, Desired), S),
+                        S1
+                end, State1, lists:sort(Add)).
+
+%% The desired specs keyed by child id, refusing duplicates and invalid
+%% specs before `do_sync/2` changes anything.
+desired_set(ChildSpecs) ->
+    lists:foldl(
+      fun(_Spec, {error, _} = Err) ->
+              Err;
+         (Spec, {ok, Acc}) ->
+              case validate_spec(Spec) of
+                  {ok, Id} when is_map_key(Id, Acc) ->
+                      {error, {duplicate_child_id, Id}};
+                  {ok, Id} ->
+                      {ok, Acc#{Id => Spec}};
+                  {error, _} = Err ->
+                      Err
+              end
+      end, {ok, #{}}, ChildSpecs).
+
 child_id(#{id := Id}) -> Id;
 child_id({Id, _, _, _, _, _}) -> Id.
 
@@ -321,17 +390,23 @@ validate(Key, ChildSpec, Elections) ->
         {ok, {_, _Other}} ->
             {error, {already_added, Key}};
         error ->
-            try {child_id(ChildSpec),
-                 portunus_delayed_restart:child_spec(ChildSpec)} of
-                {Id, Rewritten} ->
-                    case supervisor:check_childspecs([Rewritten]) of
-                        ok -> unique_child_id(Id, Elections);
-                        {error, Reason} ->
-                            {error, {invalid_child_spec, Reason}}
-                    end
-            catch _:_ ->
-                    {error, {invalid_child_spec, ChildSpec}}
+            case validate_spec(ChildSpec) of
+                {ok, Id} -> unique_child_id(Id, Elections);
+                {error, _} = Err -> Err
             end
+    end.
+
+validate_spec(ChildSpec) ->
+    try {child_id(ChildSpec),
+         portunus_delayed_restart:child_spec(ChildSpec)} of
+        {Id, Rewritten} ->
+            case supervisor:check_childspecs([Rewritten]) of
+                ok -> {ok, Id};
+                {error, Reason} ->
+                    {error, {invalid_child_spec, Reason}}
+            end
+    catch _:_ ->
+            {error, {invalid_child_spec, ChildSpec}}
     end.
 
 %% Two keys sharing one child id would share one local child: stepping one

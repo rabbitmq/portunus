@@ -44,7 +44,7 @@ majority, and so never reaches the machine.
          {locks_held,               7, gauge,   "Locks currently held"},
          {leases_active,            8, gauge,   "Active leases"},
          {waiters,                  9, gauge,   "Queued succession candidates (succession depth)"},
-         {fencing_token,           10, gauge,   "Highest fencing token issued"},
+         {fencing_token,           10, gauge,   "Index part of the highest fencing token issued"},
          {leader_changes_total,    11, counter, "Times this node became leader"},
          {acquires_total,          12, counter, "Successful lock acquisitions"},
          {acquire_conflicts_total, 13, counter, "Acquires rejected (already held)"},
@@ -54,7 +54,11 @@ majority, and so never reaches the machine.
          {failures_due_to_lack_of_online_quorum_total, 17, counter, "Commands and queries that failed because there was no online quorum (majority)"},
          {transfers_total,         18, counter, "Targeted ownership transfers that handed a key to a named node"},
          {transfer_no_contender_total, 19, counter, "Targeted transfers refused because the target was not a ready contender"},
-         {queue_leaves_total,      20, counter, "Succession bids withdrawn with leave_succession_queue"}]).
+         {queue_leaves_total,      20, counter, "Succession bids withdrawn with leave_succession_queue"},
+         %% Tokens are epoch-packed and exceed the gauge's 64-bit atomic, so
+         %% the two parts are published separately (`portunus:token_info/1`
+         %% decomposes a token the same way).
+         {fencing_epoch,           21, gauge,   "Epoch part of the highest fencing token issued"}]).
 
 -doc "Create the seshat group and register the field spec. Idempotent.".
 -spec init() -> ok.

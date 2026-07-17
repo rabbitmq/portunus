@@ -27,9 +27,9 @@ all() ->
      client_guards_reject_bad_ttls].
 
 bad_grant_fields_are_rejected(_Config) ->
-    S0 = portunus_machine:init(#{}),
+    S0 = stamped_state(),
     [begin
-         {S1, Reply} = apply_cmd(Cmd, 1, S0),
+         {S1, Reply} = apply_cmd(Cmd, 2, S0),
          ?assertEqual({error, unknown_command}, Reply),
          ?assertEqual(S0, S1)
      end || Cmd <- [{grant_lease, undefined, "5000", o, undefined},
@@ -40,8 +40,8 @@ bad_grant_fields_are_rejected(_Config) ->
     ok.
 
 bad_watch_pid_is_rejected(_Config) ->
-    S0 = portunus_machine:init(#{}),
-    {S1, Reply} = apply_cmd({watch, key, not_a_pid}, 1, S0),
+    S0 = stamped_state(),
+    {S1, Reply} = apply_cmd({watch, key, not_a_pid}, 2, S0),
     ?assertEqual({error, unknown_command}, Reply),
     ?assertEqual(S0, S1).
 
@@ -72,6 +72,13 @@ client_guards_reject_bad_ttls(_Config) ->
                  portunus_service:start_link(name, mod, args, #{ttl_ms => 1000})),
     ?assertError(function_clause,
                  portunus_registry:start_link(name, #{ttl_ms => 1000})).
+
+%% A state whose fencing epoch is already stamped, via a membership no-op:
+%% the first applied command sets the epoch whatever it is, so an untouched
+%% state is only comparable once that one-time transition is behind it.
+stamped_state() ->
+    {S, ok} = apply_cmd({nodeup, 'n@host'}, 1, portunus_machine:init(#{})),
+    S.
 
 apply_cmd(Cmd, Ix, S) ->
     case portunus_machine:apply(portunus_test_helpers:meta(Ix), Cmd, S) of

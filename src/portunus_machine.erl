@@ -13,8 +13,10 @@ tick-based lease expiry.
 Determinism rules (see AGENTS.md): `apply/3` never reads node-local
 time (only the leader-stamped `system_time` in the command metadata),
 never calls `make_ref/0`/`self/0`, and mints tokens/ids from the Raft
-`index`. Timers and monitors are effects that only *trigger* commands;
-the decision is always re-derived from replicated state.
+`index`, packed with a per-incarnation epoch (see `token_info/1`) so a
+re-formed cluster mints above the previous incarnation's fences. Timers
+and monitors are effects that only *trigger* commands; the decision is
+always re-derived from replicated state.
 """.
 
 -behaviour(ra_machine).
@@ -33,13 +35,18 @@ the decision is always re-derived from replicated state.
          query_contenders/2,
          query_status/1]).
 
+-export([token_info/1]).
+
 -define(DEFAULT_TICK_MS, 1000).
 -define(DEFAULT_SNAPSHOT_INTERVAL, 4096).
+%% Client-facing identifiers are `(Epoch bsl ?EPOCH_SHIFT) + Index`; 64 bits
+%% holds any real log's index.
+-define(EPOCH_SHIFT, 64).
 
 -type lock_key() :: term().
 -type lease_id() :: term().
 -type token() :: non_neg_integer().
-%% A watch registration handle: a Raft index.
+%% A watch registration handle: an epoch-packed Raft index.
 -type watch_ref() :: non_neg_integer().
 -type owner() :: term().
 -type owner_info() :: #{owner := owner(), lease := lease_id(),
@@ -109,6 +116,11 @@ the decision is always re-derived from replicated state.
                   watchers = #{} :: #{lock_key() => #{pid() => token()}},
                   %% pids currently monitored, to avoid duplicate effects
                   monitored = #{} :: #{pid() => true},
+                  %% the fencing epoch: the leader-stamped `system_time` of this
+                  %% incarnation's first applied command, packed into every
+                  %% client-facing identifier so a re-formed cluster mints above
+                  %% the dead incarnation's fences
+                  epoch = 0 :: non_neg_integer(),
                   %% the highest fencing token produced so far, exposed as a metric (a gauge)
                   max_token = 0 :: token()}).
 
@@ -132,7 +144,20 @@ init(Config) ->
 -spec apply(ra_machine:command_meta_data(), command(), state()) ->
     {state(), term(), ra_machine:effects()}.
 apply(Meta, Cmd, State0) ->
-    maybe_release_cursor(Meta, do_apply(Meta, Cmd, State0)).
+    maybe_release_cursor(Meta, do_apply(Meta, Cmd, ensure_epoch(Meta, State0))).
+
+%% The first applied command with a positive leader-stamped `system_time`
+%% sets the epoch. The stamp is in the log, so every replica, replay and
+%% snapshot recovery derives the same value; the positive guard means a
+%% pathological clock degrades to raw-index identifiers instead of minting
+%% negative ones.
+ensure_epoch(Meta, #?MODULE{epoch = 0} = State) ->
+    case maps:get(system_time, Meta, 0) of
+        T when T > 0 -> State#?MODULE{epoch = T};
+        _ -> State
+    end;
+ensure_epoch(_Meta, State) ->
+    State.
 
 %% A release cursor every `snapshot_interval` entries lets Ra snapshot
 %% and truncate the log.
@@ -159,7 +184,7 @@ do_apply(Meta, {grant_lease, ProposedId, TtlMs, Owner, Pid}, State0)
        (Pid =:= undefined orelse is_pid(Pid)) ->
     Now = now_ms(Meta),
     LeaseId = case ProposedId of
-                  undefined -> index(Meta);
+                  undefined -> packed_index(Meta, State0);
                   _ -> ProposedId
               end,
     case maps:find(LeaseId, State0#?MODULE.leases) of
@@ -274,7 +299,7 @@ do_apply(_Meta, {leave_queue, LockKey, LeaseId}, State0) ->
 %% A non-pid here would crash every successive leader through the monitor
 %% effect and `state_enter/2`'s re-derivation, hence the guard.
 do_apply(Meta, {watch, LockKey, Pid}, State0) when is_pid(Pid) ->
-    Ref = index(Meta),
+    Ref = packed_index(Meta, State0),
     Ws0 = maps:get(LockKey, State0#?MODULE.watchers, #{}),
     Ws1 = maps:put(Pid, Ref, Ws0),
     State1 = State0#?MODULE{watchers = maps:put(LockKey, Ws1,
@@ -390,6 +415,9 @@ handle_aux(_RaState, _Type, _Cmd, Aux, RaAux) ->
 node_gauges(#?MODULE{cluster = Cluster} = Mac, RaAux) ->
     #{locks := Locks, leases := Leases, waiters := Waiters,
       fencing_token := Token} = overview(Mac),
+    %% Seshat gauges are 64-bit atomics: a packed token does not fit and
+    %% would wrap silently, so publish its components.
+    #{epoch := TokenEpoch, index := TokenIndex} = token_info(Token),
     KM = ra:key_metrics({Cluster, node()}),
     Commit = maps:get(commit_index, KM, 0),
     Applied = maps:get(last_applied, KM, 0),
@@ -407,7 +435,8 @@ node_gauges(#?MODULE{cluster = Cluster} = Mac, RaAux) ->
     #{locks_held => Locks,
       leases_active => Leases,
       waiters => Waiters,
-      fencing_token => Token,
+      fencing_token => TokenIndex,
+      fencing_epoch => TokenEpoch,
       raft_term => maps:get(term, KM, 0),
       apply_lag => max(0, Commit - Applied),
       log_entries => max(0, Last - Snapshot),
@@ -424,6 +453,17 @@ overview(State) ->
       waiters => Waiters,
       watchers => maps:size(State#?MODULE.watchers),
       fencing_token => State#?MODULE.max_token}.
+
+-doc """
+Decompose an epoch-packed identifier (a fencing token, an auto-assigned
+lease id, or a watch reference) for logging and debugging. An epoch of `0`
+means the identifier was minted before the incarnation had a stamp.
+""".
+-spec token_info(token()) ->
+    #{epoch := non_neg_integer(), index := non_neg_integer()}.
+token_info(Token) when is_integer(Token), Token >= 0 ->
+    #{epoch => Token bsr ?EPOCH_SHIFT,
+      index => Token band ((1 bsl ?EPOCH_SHIFT) - 1)}.
 
 -spec version() -> ra_machine:version().
 version() -> 0.
@@ -473,6 +513,15 @@ query_status(State) ->
 now_ms(Meta) -> maps:get(system_time, Meta).
 
 index(Meta) -> maps:get(index, Meta).
+
+%% Every identifier returned to a client packs the epoch: tokens, auto lease
+%% ids and watch references are compared or matched across time, and a raw
+%% index minted by a new incarnation aliases one minted by the old. Addition
+%% rather than `bor`: identical while the index is below `2^?EPOCH_SHIFT`,
+%% and still monotonic in both arguments if that ever fails to hold. The
+%% waiter `seq` stays a raw index: it never leaves one incarnation's state.
+packed_index(Meta, #?MODULE{epoch = Epoch}) ->
+    (Epoch bsl ?EPOCH_SHIFT) + index(Meta).
 
 set_lease(LeaseId, Lease, State) ->
     State#?MODULE{leases = maps:put(LeaseId, Lease, State#?MODULE.leases)}.
@@ -546,7 +595,7 @@ do_acquire(Meta, LeaseId, LockKey, Owner, Context, Wait, Score, State0) ->
                              [incr(acquire_conflicts_total, State0)]}
                     end;
                 error ->
-                    Token = index(Meta),
+                    Token = packed_index(Meta, State0),
                     Held = #held_lock{token = Token, owner = Owner,
                                  context = Context, since = now_ms(Meta)},
                     Lease1 = Lease#lease{keys = maps:put(LockKey, Held,
@@ -599,7 +648,7 @@ promote_waiter(Meta, LockKey, Revoking, State0, Effs) ->
             Rest = [W || W <- Live, W#waiter.seq =/= Seq],
             State1 = set_waiters(LockKey, Rest, State0),
             Lease = maps:get(LeaseId, State1#?MODULE.leases),
-            Token = index(Meta),
+            Token = packed_index(Meta, State1),
             Held = #held_lock{token = Token, owner = Best#waiter.owner,
                          context = Best#waiter.context, since = now_ms(Meta)},
             Lease1 = Lease#lease{keys = maps:put(LockKey, Held,
@@ -641,7 +690,7 @@ do_transfer(Meta, LockKey, OldLeaseId, TargetOwner, State0) ->
                                  set_lease(OldLeaseId, OldLease1, State0)),
             %% Install the target as the new holder with a fresh token.
             NewLease = maps:get(NewLeaseId, State1#?MODULE.leases),
-            Token = index(Meta),
+            Token = packed_index(Meta, State1),
             Held = #held_lock{token = Token, owner = Best#waiter.owner,
                               context = Best#waiter.context, since = now_ms(Meta)},
             NewLease1 = NewLease#lease{keys = maps:put(LockKey, Held,

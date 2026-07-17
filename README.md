@@ -36,10 +36,12 @@ Raft implementation: Ra.
    independent of clocks. Lease expiry (TTL) is liveness: approximate
    and clock-dependent. A client must treat a renewal failure as
    "lease possibly lost" and stop acting
- * Fencing tokens. Every grant returns a token (the Raft index). The
-   guarded resource (usually another component) records the highest
-   token it has seen and rejects stale ones. This is what makes a lock
-   safe across a paused or partitioned holder
+ * Fencing tokens. Every grant returns a token (the Raft index, packed
+   with a per-incarnation epoch so a re-formed cluster mints above the
+   fences of the one it replaced; `portunus:token_info/1` decomposes
+   one). The guarded resource (usually another component) records the
+   highest token it has seen and rejects stale ones. This is what makes
+   a lock safe across a paused or partitioned holder
  * Leases. A lock is held under a TTL lease and stays held for as long
    as the lease is renewed. Many exclusive keys can share one lease (a
    session)
@@ -82,10 +84,10 @@ directory, and the nodes then form a named cluster:
 %% on every node, once
 ok = portunus:start_system(portunus, "/var/lib/portunus"),
 
-%% on the first node: form the cluster
+%% on the first node
 {ok, _Started, _Failed} = portunus:start_cluster(portunus, my_locks, [node()]),
 
-%% on the other nodes: join the existing members (idempotent)
+%% on the other nodes; idempotent
 ok = portunus:join_or_form(portunus, my_locks, ['first@host']).
 ```
 
@@ -102,7 +104,7 @@ returns a fencing token:
 ```erlang
 {ok, Lease} = portunus:grant_lease(my_locks, 30000),
 {ok, Token} = portunus:acquire(my_locks, {resource, 42}, Lease, self()),
-%% carry Token into every external write made under this lock
+%% carry Token into every external write under this lock
 ok = portunus:release(my_locks, {resource, 42}, Token).
 ```
 
@@ -137,10 +139,10 @@ releases, is revoked, or expires:
 ```erlang
 case portunus:acquire_or_join_succession_queue(my_locks, Key, Lease, self()) of
     {ok, Token} ->
-        %% the key was free: we own it now
+        %% free: we own it
         owned(Token);
     {queued, _Depth} ->
-        %% promoted later: the lease holder receives this message
+        %% promoted later, by message to the lease holder
         receive
             {portunus, granted, Key, Token, Lease} -> owned(Token)
         end
@@ -335,13 +337,13 @@ argument, a custom `portunus_affinity` behaviour module, or a scoring
 fun:
 
 ```erlang
-%% prefer these nodes, earliest first, over any others
+%% prefer these nodes, earliest first
 #{affinity => {preferred, ['a@host', 'b@host']}}
 
 %% spread keys evenly across members (rendezvous hashing)
 #{affinity => {hash, undefined}}
 
-%% the least-loaded node wins, by a locally read metric
+%% least-loaded node wins, by a locally read metric
 #{affinity => {metric, fun() -> spare_capacity() end}}
 ```
 
@@ -355,8 +357,7 @@ claims are untouched, and the next promotion skips the leaver:
 {ok, Lease} = portunus:grant_lease(my_locks, 30000),
 {queued, _} = portunus:acquire_or_join_succession_queue(my_locks, Key, Lease,
                                                         self()),
-%% this process is no longer interested in Key; the lease lives on and
-%% other keys claimed under it are unaffected
+%% no longer interested in Key; the lease and its other keys live on
 ok = portunus:leave_succession_queue(my_locks, Key, Lease).
 ```
 
