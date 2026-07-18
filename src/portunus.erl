@@ -75,6 +75,8 @@ target any member's replica (`reset_server/2`).
 -include("portunus.hrl").
 
 -define(CMD_TIMEOUT, 5000).
+-define(MEMBERSHIP_CHANGE_RETRIES, 20).
+-define(MEMBERSHIP_CHANGE_RETRY_MS, 100).
 
 -type name() :: atom().
 -type system() :: atom().
@@ -872,18 +874,25 @@ sequence, is safe; removal is never automatic (see `remove_member/2`).
 """.
 -spec add_member(name(), node()) -> ok_or_error(term()).
 add_member(Name, Node) ->
-    case ra:add_member(leader_or_local(Name), {Name, Node}) of
-        {ok, _, _} -> ok;
-        {timeout, _} = T -> {error, T};
-        {error, _} = Err -> Err
-    end.
+    change_membership(Name, fun ra:add_member/2, {Name, Node},
+                      ?MEMBERSHIP_CHANGE_RETRIES).
 
 -doc "Remove a member. Removal is explicit, never automatic.".
 -spec remove_member(name(), node()) -> ok_or_error(term()).
 remove_member(Name, Node) ->
-    case ra:remove_member(leader_or_local(Name), {Name, Node}) of
+    change_membership(Name, fun ra:remove_member/2, {Name, Node},
+                      ?MEMBERSHIP_CHANGE_RETRIES).
+
+%% Ra allows one uncommitted membership change at a time, so a change that
+%% follows another too closely gets `cluster_change_not_permitted` until the
+%% prior one is applied. It is transient: retry with a short pause.
+change_membership(Name, Change, ServerId, Retries) ->
+    case Change(leader_or_local(Name), ServerId) of
         {ok, _, _} -> ok;
         {timeout, _} = T -> {error, T};
+        {error, cluster_change_not_permitted} when Retries > 0 ->
+            timer:sleep(?MEMBERSHIP_CHANGE_RETRY_MS),
+            change_membership(Name, Change, ServerId, Retries - 1);
         {error, _} = Err -> Err
     end.
 
