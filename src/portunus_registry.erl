@@ -16,21 +16,15 @@ an extended `{permanent, Delay}` restart option which `portunus_delayed_restart`
 rewrites) under a key; `portunus` runs one election per key, and the elected
 owner starts that child under a local Erlang/OTP supervisor.
 
-`remove/2` stops the local election; the child is gone cluster-wide once every node that
-added it calls `remove/2`, and a `remove/2` on the owner alone moves the
-child to another node. `sync/2` reconciles the whole set in one call: a
-consumer that mirrors an external source of truth should use it, because
-an add-only reconcile resurrects deleted children on a node that was
-offline at delete time.
+/remove/2` is the counterpart of `add/3`. A child is permanently removed
+from the cluster once every node applies the change.
 
-No new replicated state: the registry holds only local election pids and
-a local supervisor. Restart is local and per-child, with one exception: a
-child that crash-loops past the local supervisor's intensity takes the
-registry down with `{local_sup_down, _}`, and the restarted registry is
-empty: the host re-adds its children, as it does after a node restart.
+`remove/2` on the owner alone moves the child to another node.
 
-The registry's cleanup releases cluster-wide locks, so a child spec
-supervising it should give it a generous `shutdown` value.
+Restart is local and per-child, with one exception: a child that
+crash-loops past the local supervisor's intensity takes the
+registry down with `{local_sup_down, _}`. The restarted registry is
+initially empty: the host re-adds its children, as it does after a node restart.
 """.
 
 -include("portunus.hrl").

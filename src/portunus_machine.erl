@@ -10,13 +10,14 @@ The `portunus` Ra state machine. It manages leases, locks, fencing
 tokens, a score-ordered succession queue (FIFO among equal scores), and
 tick-based lease expiry.
 
-Determinism rules (see AGENTS.md): `apply/3` never reads node-local
-time (only the leader-stamped `system_time` in the command metadata),
-never calls `make_ref/0`/`self/0`, and mints tokens/ids from the Raft
-`index`, packed with a per-incarnation epoch (see `token_info/1`) so a
-re-formed cluster mints above the previous incarnation's fences. Timers
-and monitors are effects that only *trigger* commands; the decision is
-always re-derived from replicated state.
+Key decisions:
+
+1. `apply/3` never reads node-local time, only the leader-stamped `system_time` in the command metadata.
+2. Never uses `make_ref/0`, `self/0`, and derives tokens and IDs from the Raft
+   log `index`, packed with a per-incarnation (think restarts) epoch (see `token_info/1`)
+
+This main goal of having per-incarnation epochs is to make sure
+that higher epochs result in higher fencing tokens produced.
 """.
 
 -behaviour(ra_machine).
