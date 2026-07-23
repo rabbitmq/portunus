@@ -194,6 +194,35 @@ ok = portunus_session:release(Session, {vhost, <<"a">>}),
 ok = portunus_session:close(Session).
 ```
 
+## Batched Lease Renewal
+
+Every renewal is a Raft log append, followed by an `fsync(2)` by every member. 
+
+With hundreds or thousands of auto-renewing leases per node the per-lease
+renewers alone can degrade I/O throughput. `portunus_batch_keepalive`
+is one registered process per node that renews every attached lease
+sharing a cluster and TTL in a single `renew_leases` command per
+`TTL/3` round, so the write rate is per node, not per lease:
+
+```erlang
+{ok, Lease} = portunus:grant_lease(my_locks, 30000),
+ok = portunus_batch_keepalive:attach(my_locks, Lease, 30000),
+%% ... acquire and work as usual ...
+ok = portunus_batch_keepalive:detach(my_locks, Lease).
+```
+
+Per-lease semantics match the per-lease renewer: an expired lease
+notifies the attaching process with `{portunus, lease_lost, LeaseId}`,
+transient failures are retried, and a dead owner's lease is dropped.
+The renewer is supervised; an owner should monitor it and re-attach on
+`'DOWN'`, and the lease survives the restart if the re-attach lands
+within a TTL of the last renewal.
+
+`portunus_election` renews through it, so elections and everything
+built on them (`portunus_service`, `portunus_supervisor`,
+`portunus_registry`) already batch. `lock/3`, `grant_lease/3` with
+`auto_renew`, and `portunus_session` keep their own per-lease renewer.
+
 ## Health and Introspection
 
 `status/1` returns the leader, members, quorum, and machine-derived
@@ -414,6 +443,8 @@ and heals a first-boot split.
    on top of the registry
  * `portunus_registry`: a dynamic cluster-wide supervisor with children
    added and removed at runtime
+ * `portunus_batch_keepalive`: a per-node renewer that batches lease
+   renewals sharing a cluster and TTL into one Ra command per round
  * `portunus_affinity`: placement strategies for succession, built-in
    and custom
  * `portunus_counters`: seshat metrics

@@ -1,4 +1,9 @@
-## Changes in `0.10.0` (in development)
+## Changes in `0.11.0` (in development)
+
+No changes yet.
+
+
+## Changes in `0.10.0` (Jul 22, 2026)
 
 ### Enhancements
 
