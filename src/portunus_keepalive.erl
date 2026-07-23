@@ -28,6 +28,12 @@ A lease renewal attempt can fail if the `portunus` Ra machine does not
 have an online quorum.
 
 The renewer retries until the lease expires.
+
+For environments where hundreds or thousands of leases on one node are to be expected,
+prefer `portunus_batch_keepalive` which renews multiple leases in
+one Ra command per round.
+
+`portunus_election` uses it.
 """.
 
 -include("portunus.hrl").

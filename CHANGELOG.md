@@ -1,6 +1,26 @@
 ## Changes in `0.10.0` (in development)
 
-No changes yet.
+### Enhancements
+
+ * `portunus_batch_keepalive`: a node-wide lease renewer that renews all leases
+   of one `portunus` instance (Ra cluster) with the same TTL in one Ra command
+   per `TTL/3` round, instead of one command per lease.
+
+   Every renewal command is a Raft log append which is `fsync(2)`ed by
+   every member, so with hundreds or thousands of leases per node the per-lease
+   renewers produce enough `fsync(2)`s to degrade I/O throughput.
+
+   Per-lease semantics match `portunus_keepalive`: an expired lease notifies its owner
+   process with `{portunus, lease_lost, LeaseId}`, transient failures are
+   retried, and a dead owner's lease is dropped
+
+ * `portunus_election` renews its lease through `portunus_batch_keepalive`, so
+   every consumer built on elections (`portunus_registry`, `portunus_service`,
+   `portunus_supervisor`) benefits from its reduced Raft log commit rate.
+   
+   
+   Note that `portunus:lock/3`, `grant_lease/3` with `auto_renew`, `keep_alive/3` options, plus
+   `portunus_session` keep using the original per-lease renewer
 
 
 ## Changes in `0.9.0` (Jul 17, 2026)

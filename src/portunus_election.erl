@@ -51,7 +51,10 @@ on external resources.
                 args :: term(),
                 affinity = default :: portunus_affinity:spec(),
                 lease_id :: portunus:option(portunus:lease_id()),
-                keepalive :: portunus:option(pid()),
+                %% Monitor on the shared renewer (`portunus_batch_keepalive`).
+                %% As long as owners can re-attach and monitor the renewer again
+                %% after a 'DOWN' event within lease TTL, the lease is maintained (not lost).
+                renewer_mon :: portunus:option(reference()),
                 token :: portunus:option(portunus:token()),
                 cb_state :: term(),
                 role = follower :: follower | leader,
@@ -167,14 +170,14 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(contend, State0) ->
-    %% Establish a holder-linked auto-renewing lease, then enqueue. The
-    %% renewer is live before elected runs.
+    %% Establish an auto-renewing lease, then enqueue. The renewal is live
+    %% before elected runs.
     maybe
         {ok, LeaseId} ?= portunus:grant_lease(State0#state.name,
                                               State0#state.ttl_ms),
-        {ok, KA} ?= portunus_keepalive:start_link(State0#state.name, LeaseId,
-                                                  State0#state.ttl_ms),
-        State1 = State0#state{lease_id = LeaseId, keepalive = KA},
+        {ok, Mon} ?= attach_renewal(State0#state.name, LeaseId,
+                                    State0#state.ttl_ms),
+        State1 = State0#state{lease_id = LeaseId, renewer_mon = Mon},
         Owner = node(),
         case portunus:acquire_or_join_succession_queue(
                State1#state.name, State1#state.key, LeaseId, Owner,
@@ -207,8 +210,19 @@ handle_info({portunus, granted, Key, Token, LeaseId},
 handle_info({portunus, lease_lost, LeaseId},
             #state{lease_id = LeaseId} = State) ->
     {noreply, lose_and_recontend(State)};
-handle_info({'EXIT', KA, _Reason}, #state{keepalive = KA} = State) ->
-    {noreply, lose_and_recontend(State)};
+handle_info({'DOWN', Mon, process, _Pid, _Reason},
+            #state{renewer_mon = Mon} = State) ->
+    %% The lease stays valid for TTL since (after) its last renewal.
+    %% If the renewer fails, the owner process re-monitors. The resource ownership
+    %% is not lost.
+    %%
+    %% If the lease expired before such re-attachment could take place,
+    %% the next round delivers `lease_lost`.
+    {noreply, reattach_renewal(State)};
+handle_info(reattach,
+            #state{lease_id = LeaseId, renewer_mon = undefined} = State)
+  when LeaseId =/= undefined ->
+    {noreply, reattach_renewal(State)};
 handle_info({reconcile, Gen}, #state{reconcile = Gen, role = follower,
                                      name = Name, key = Key,
                                      lease_id = LeaseId} = State)
@@ -299,8 +313,8 @@ do_transfer_to(TargetNode, #state{name = Name, key = Key, token = Token,
                     %% The command timed out, so it may still commit. Restarting
                     %% the work on the old token would run it on two nodes if it
                     %% did (the target is granted while this node keeps going),
-                    %% and nothing would ever correct that: the keepalive keeps
-                    %% the lease alive, so no `lease_lost` arrives. Keep the work
+                    %% and nothing would ever correct that: renewal keeps the
+                    %% lease alive, so no `lease_lost` arrives. Keep the work
                     %% stopped and the lease renewing until the reconciliation read
                     %% answers: if this node still owns the key the work is
                     %% restored, otherwise the election re-contends.
@@ -342,18 +356,45 @@ defer_contend(State) ->
     erlang:send_after(1000, self(), contend),
     reset(State).
 
-%% Stop the renewer and revoke the now-orphaned lease so the next grant does not
-%% queue behind our own still-held lock; both are best-effort under no_quorum.
-teardown_lease(#state{name = Name, lease_id = LeaseId, keepalive = KA}) ->
-    _ = case KA of undefined -> ok; _ -> catch portunus_keepalive:stop(KA) end,
+%% Unmonitor the renewer, detach the lease from it, and revoke the now-orphaned
+%% lease so the next grant does not queue behind our own still-held lock; all
+%% best-effort.
+teardown_lease(#state{name = Name, lease_id = LeaseId, renewer_mon = Mon}) ->
+    _ = case Mon of
+            undefined -> ok;
+            _ -> erlang:demonitor(Mon, [flush])
+        end,
     _ = case LeaseId of
             undefined -> ok;
-            _ -> catch portunus:revoke_lease(Name, LeaseId)
+            _ ->
+                catch portunus_batch_keepalive:detach(Name, LeaseId),
+                catch portunus:revoke_lease(Name, LeaseId)
         end,
     ok.
 
+%% The monitor is taken after the call, so a renewer that dies in between
+%% delivers an immediate 'DOWN' and the re-attach path runs.
+attach_renewal(Name, LeaseId, TtlMs) ->
+    try portunus_batch_keepalive:attach(Name, LeaseId, TtlMs) of
+        ok -> {ok, erlang:monitor(process, portunus_batch_keepalive)}
+    catch
+        exit:_ -> {error, renewer_down}
+    end.
+
+%% The renewer is supervised, so being down is a restart window: retry
+%% shortly rather than churn ownership.
+reattach_renewal(#state{name = Name, lease_id = LeaseId,
+                        ttl_ms = TtlMs} = State) ->
+    case attach_renewal(Name, LeaseId, TtlMs) of
+        {ok, Mon} ->
+            State#state{renewer_mon = Mon};
+        {error, renewer_down} ->
+            erlang:send_after(500, self(), reattach),
+            State#state{renewer_mon = undefined}
+    end.
+
 reset(State) ->
-    State#state{role = follower, lease_id = undefined, keepalive = undefined,
+    State#state{role = follower, lease_id = undefined, renewer_mon = undefined,
                 token = undefined, cb_state = undefined,
                 pending_transfer = false}.
 

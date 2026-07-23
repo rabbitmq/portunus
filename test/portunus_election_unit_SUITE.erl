@@ -18,6 +18,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2]).
 -export([crash_promotes_standby/1,
          lease_loss_steps_down_and_recontends/1,
+         renewer_restart_keeps_ownership/1,
          transfer_to_self_is_noop/1,
          transfer_to_unready_target_refuses_without_stepdown/1,
          transfer_to_non_owner_is_not_owner/1]).
@@ -29,6 +30,7 @@
 all() ->
     [crash_promotes_standby,
      lease_loss_steps_down_and_recontends,
+     renewer_restart_keeps_ownership,
      transfer_to_self_is_noop,
      transfer_to_unready_target_refuses_without_stepdown,
      transfer_to_non_owner_is_not_owner].
@@ -66,20 +68,41 @@ crash_promotes_standby(_Config) ->
     end,
     true = exit(E2, kill).
 
-%% Killing the renewer loses the lease: the leader steps down, re-contends,
-%% and (alone here) wins again once its orphaned lease expires.
+%% After a revoke, the next batched renewal reports `lease_expired` and the
+%% election gets `lease_lost`: it steps down, re-contends, and (alone here)
+%% wins again.
 lease_loss_steps_down_and_recontends(_Config) ->
     Key = {election, lease_loss},
     Ttl = 2000,
     {ok, E} = start(Key, Ttl),
     receive {elected, Key, _T1, E} -> ok after 30000 -> ct:fail(no_leader) end,
-    true = exit(keepalive_of(E), kill),
+    Lease = attached_lease(),
+    ok = portunus:revoke_lease(?NAME, Lease),
     receive {stepped_down, Key, E} -> ok after 30000 -> ct:fail(no_stepdown) end,
     receive
         {elected, Key, _T2, E} -> ok
     after Ttl + 10000 ->
         ct:fail(no_recontend)
     end,
+    true = exit(E, kill).
+
+%% A renewer restart must not cost ownership: the election re-attaches and
+%% its lease keeps being renewed past the TTL.
+renewer_restart_keeps_ownership(_Config) ->
+    Key = {election, renewer_restart},
+    Ttl = 2000,
+    {ok, E} = start(Key, Ttl),
+    receive {elected, Key, _T, E} -> ok after 30000 -> ct:fail(no_leader) end,
+    Hub = whereis(portunus_batch_keepalive),
+    Mon = erlang:monitor(process, Hub),
+    exit(Hub, kill),
+    receive {'DOWN', Mon, process, Hub, _} -> ok
+    after 5000 -> ct:fail(hub_not_killed)
+    end,
+    timer:sleep(Ttl + 2000),
+    receive {stepped_down, Key, E} -> ct:fail(unexpected_stepdown) after 0 -> ok end,
+    true = portunus_election:is_leader(E),
+    _ = attached_lease(),
     true = exit(E, kill).
 
 %% Transferring to this node returns `ok`: no step-down, still the owner.
@@ -139,11 +162,14 @@ await_contender(Key) ->
               end
       end).
 
-%% The election's links are the test process and its keepalive; the latter is
-%% the one to kill to simulate lease loss.
-keepalive_of(E) ->
-    {links, Links} = process_info(E, links),
-    case Links -- [self()] of
-        [KA] -> KA;
-        Other -> ct:fail({unexpected_links, Other})
-    end.
+%% An earlier case's killed elections may still have leases attached.
+%% Wait until only this case's lease remains.
+attached_lease() ->
+    ok = portunus_test_helpers:await_condition(
+           fun() ->
+                   1 =:= length(all_attached())
+           end),
+    hd(all_attached()).
+
+all_attached() ->
+    lists:append(maps:values(portunus_batch_keepalive:overview())).

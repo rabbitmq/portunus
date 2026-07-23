@@ -78,7 +78,11 @@ target any member's replica (`reset_server/2`).
 -define(MEMBERSHIP_CHANGE_RETRIES, 20).
 -define(MEMBERSHIP_CHANGE_RETRY_MS, 100).
 
--type name() :: atom().
+%% The name of one `portunus` instance: the Ra cluster that hosts one lock
+%% machine. Not the name of any resource guarded by it.
+-type cluster_name() :: atom().
+%% Kept as an alias for existing callers; prefer `cluster_name()`.
+-type name() :: cluster_name().
 -type system() :: atom().
 -type lock_key() :: portunus_machine:lock_key().
 -type lease_id() :: portunus_machine:lease_id().
@@ -142,7 +146,7 @@ target any member's replica (`reset_server/2`).
 -opaque handle() :: #{name := name(), key := lock_key(), lease := lease_id(),
                       token := token(), renewer := pid()}.
 
--export_type([name/0, system/0, lock_key/0, lease_id/0, token/0, owner/0,
+-export_type([cluster_name/0, name/0, system/0, lock_key/0, lease_id/0, token/0, owner/0,
               ttl/0, server_id/0, owner_info/0, succession_opts/0, watch_ref/0,
               grant_opts/0, env/0, status/0, lease_error/0, acquire_error/0,
               release_error/0, transfer_error/0, leave_queue_error/0,

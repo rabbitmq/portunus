@@ -22,4 +22,7 @@ init([]) ->
     %% application's lifetime, and hosts any future node-local helpers.
     ok = portunus_delayed_restart:ensure_table(),
     SupFlags = #{strategy => one_for_one, intensity => 5, period => 10},
-    {ok, {SupFlags, []}}.
+    BatchKeepalive = #{id => portunus_batch_keepalive,
+                       start => {portunus_batch_keepalive, start_link, []},
+                       shutdown => 5000},
+    {ok, {SupFlags, [BatchKeepalive]}}.
