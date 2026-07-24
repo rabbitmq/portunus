@@ -1,153 +1,132 @@
 # Instructions for AI Agents
 
-## What is This Codebase?
+## What This Is
 
-`portunus` is a small, generic, Ra/Raft-based lock server for the
-Erlang ecosystem: cluster-wide mutual exclusion, TTL leases with
-renewal, leader election, and a FIFO succession queue. It is
-an `etcd`/ZooKeeper-style CP (consistency over availability) service.
-Its first job is to replace RabbitMQ's ancient `mirrored_supervisor`,
-but it does not depend on RabbitMQ.
+`portunus` is a small `ra`/Raft-based lock server for the Erlang ecosystem:
+cluster-wide mutual exclusion, TTL leases with renewal, leader election,
+and a FIFO succession queue. It is a CP (consistency over availability) service like `etcd` or ZooKeeper.
 
-It uses Ra and implements a Ra state machine. It does not depend on
-or use Khepri.
+`portunus` implements a [`ra`](http://github.com/rabbitmq/ra/) state machine.
+
+While `portunus` was originally designed and developed for the needs of the RabbitMQ Core Team,
+it is not specific to RabbitMQ.
 
 ## Target Erlang/OTP
 
-Targets Erlang/OTP 27+ and uses it deliberately: `maybe` expressions,
-`-moduledoc`/`-doc`, `proc_lib:set_label/1`, `~"…"` sigils, the built-in
-`json` module. Unlike Ra/Seshat/Osiris (which are years to nearly two
-decades old and target much older Erlang/OTP releases), this is a
-greenfield codebase with no legacy compatibility burden: prefer the
-modern construct.
+Erlang/OTP 27+: use `maybe`, `-moduledoc`, `-doc`, `proc_lib:set_label/1`,
+`~"…"` sigils, and the built-in `json` module as needed.
 
-## Build System
+This is a young codebase that targets modern Erlang/OTP, so prefer modern constructs.
 
-Both `rebar3` and `erlang.mk`, like Ra. `rebar3` is the primary tool;
-`erlang.mk` (`make`/`gmake`) is kept working to be a good RabbitMQ-family
-member. Look for `gmake` as well as `make`.
+## Build
 
- * `rebar3 compile` — build
- * `rebar3 ct` — Common Test suites
- * `rebar3 eunit` — EUnit (inline `-ifdef(TEST)` and `test/*_tests.erl`)
- * `rebar3 dialyzer` — must be warning-free
- * `rebar3 xref`
- * `gmake` / `gmake tests` / `gmake dialyze` — the erlang.mk equivalents
+`rebar3` is the primary build tool. `erlang.mk` (GNU Make 4, `gmake`) is kept for
+smoother integration with RabbitMQ and caters to the habits of the RabbitMQ Core Team.
 
-Run `rebar3 compile` before changing code to confirm a clean baseline.
+ * `rebar3 compile` compiles the codebase. Run it before code changes to confirm a clean baseline
+ * `rebar3 ct`: runs Common Test suites
+ * `rebar3 eunit`: runs EUnit tests (see below)
+ * `rebar3 dialyzer` runs must be warning-free
+ * `rebar3 xref` must pass
+ * `gmake`, `gmake tests` amd `gmake dialyze` are tje `erlang.mk` equivalents
 
 ## Dependencies
 
- * `ra` (3.1.x) — the Raft engine and `ra_machine` behaviour
- * `seshat` (1.x) — counters/gauges registry, used for metrics
+ * `ra` (3.1.x) — Raft engine and the `ra_machine` behaviour
+ * `seshat` (1.x) — counters registry for metrics
 
-No Khepri. No third-party runtime deps. Transport, identity, and TLS are
-the Erlang distribution's job.
+No other runtime deps. Transport, identity, and TLS come from the Erlang
+distribution.
 
 ## Module Layout
 
 Core (the replicated state machine and its client API):
 
- * `portunus_machine` — the `ra_machine`: leases, locks, fencing tokens,
-   score-ordered succession, tick-based lease expiry, monitor-driven
-   release. The crown jewel; keep it deterministic (see below)
- * `portunus` — the public client API: leases, locks, queries, cluster
-   lifecycle, and the convenience wrappers
- * `portunus_app` / `portunus_sup` — Erlang/OTP application and top
-   supervisor
- * `portunus_counters` — seshat metrics (one counter set per node)
+ * `portunus_machine`: the `ra_machine`: leases, locks, fencing tokens,
+   score-ordered succession, monitor-driven release. Must stay
+   deterministic (see below)
+ * `portunus_machine_aux`: lease renewal and expiry sweep logic; renewals
+   stay out of the Raft log and live in the leader's `aux` state
+ * `portunus`: the public client API
+ * `portunus_app`, `portunus_sup`: application and top supervisor
+ * `portunus_counters`: seshat metrics, one counter set per node
 
-Batteries (client-side extras built on top of the core, no new
-replicated state):
+Batteries (client-side extras, no new replicated state):
 
- * `portunus_keepalive` — the lease renewer process, linked to the holder
- * `portunus_session` — one lease per node holding many exclusive keys
- * `portunus_election` — keeps one elected instance of a component per
-   key; ownership moves to another node on lease loss
- * `portunus_service` — a managed set of keys, each with exactly one
-   owner (optional affinity)
- * `portunus_registry` — a dynamic cluster-wide supervisor: children are
-   added and removed at runtime, one election per key
- * `portunus_supervisor` — a declarative, `supervisor`-shaped layer built
-   on top of the registry
- * `portunus_affinity` and the `portunus_affinity_*` strategy modules —
-   placement scoring for succession
- * `portunus_delayed_restart` — rewrites the extended `{permanent, Delay}`
-   restart type into a rate-limited standard child spec
- * `portunus_local_sup` — the local supervisor an elected owner boots its
+ * `portunus_keepalive`: lease renewer process, linked to the holder
+ * `portunus_session`: one lease per node holding many exclusive keys
+ * `portunus_election`: one elected instance per key; ownership moves to
+   another node on lease loss
+ * `portunus_service`: a managed set of keys, each with exactly one owner
+ * `portunus_registry`: a dynamic cluster-wide supervisor, one election per key
+ * `portunus_supervisor`: a declarative, `supervisor`-shaped layer on the registry
+ * `portunus_affinity`, `portunus_affinity_*`: placement scoring for succession
+ * `portunus_delayed_restart`: rewrites `{permanent, Delay}` into a
+   rate-limited standard child spec
+ * `portunus_local_sup`: the local supervisor an elected owner boots
    children into
 
 ## State Machine Invariants (do not break)
 
- * **No node-local time in `apply/3`.** Use the `system_time` from the
-   command metadata (leader-stamped, identical on every replica). Never
-   `os:system_time/0`, `erlang:monotonic_time/0`, etc. inside the machine
- * **No non-determinism in `apply/3`.** No `make_ref/0`, `self/0`,
-   `node/0`-dependent branching, `Math`-random, or map iteration order
-   that escapes into state. Tokens and ids come from the Raft `index`
- * **Effects carry no authority.** Timers and monitors only *trigger*
-   commands; the decision is re-derived from replicated state
- * **Safety vs. liveness.** At-most-one-owner and monotonic fencing
-   tokens are safety (Raft + tokens, clock-independent); lease expiry is
-   liveness (approximate). A client must treat renewal failure as
-   "lease possibly lost" and stop acting
+ * No node-local time in `apply/3`: use `system_time` from the command
+   metadata, never `os:system_time/0` or `erlang:monotonic_time/0`
+ * No non-determinism in `apply/3`: no `make_ref/0`, `self/0`,
+   `node/0`-dependent branching, random values, or map iteration order
+   stored into machine state
+ * Tokens and ids come from the Raft `index`
+ * Safety: at-most-one-owner and monotonic fencing tokens, both clock-independent
+ * Liveness: a mandatory lease with expiry; approximation is acceptable
+ * A client must treat renewal failure as "lease possibly lost" and stand down
 
 ## Testing
 
- * Organise by type: `*_unit_SUITE`, `*_prop_SUITE`, `*_integration_SUITE`
- * Property-based tests use PropEr; property functions are named `prop_`,
-   each with a brief comment, since properties are hard to read. Keep them
-   in their own `*_prop_SUITE` module (proper.hrl clashes with eunit/ct)
- * Test modules do not carry `-moduledoc false` (or any moduledoc)
- * The core safety invariant, at most one owner per key, is the
-   property worth checking hardest
- * Run a single CT suite: `rebar3 ct --suite test/portunus_machine_unit_SUITE`
+ * Organise test modules by type: `*_unit_SUITE`, `*_prop_SUITE`, `*_integration_SUITE`
+ * PropEr properties are named `prop_`, each with a brief comment, and live
+   in their own `*_prop_SUITE` (proper.hrl clashes with eunit/ct)
+ * Test modules carry no moduledoc, not even `-moduledoc false`
+ * The property worth checking hardest: at most one owner per key
+ * To run a single CT suite, use `rebar3 ct --suite`: e.g.
+   `rebar3 ct --suite test/portunus_machine_unit_SUITE`
 
 ## Comments, Writing Style and Voice
 
-Only add very important comments to the tests and the implementation.
+Only add very important comments to tests and implementation.
 
 ### Voice
 
-Write like a senior engineer who values clarity and simplicity. This applies
-to all prose: design docs, analyses, notes, and commit messages.
+Write like a senior engineer who values clarity and simplicity, in all
+prose: design docs, analyses, notes, and commit messages.
 
  * Plain and factual: state the why in one line, never narrate the what
- * Literal mechanism over metaphor: name the actual thing, not an image of it
+ * Name the actual mechanism, not an image of it
  * Prefer the plainest word. No coined verbs, no jargon for its own sake
  * No flourish, no editorializing, no imagery. Real domain terms are fine
- * If a sentence needs a second clause to justify itself, it is probably too clever
- * Plain full sentences over compressed clever noun phrases: "convenience
-   module", not "a `mirrored_supervisor`-shaped convenience"
+ * If a sentence needs a second clause to justify itself, it is too clever
+ * Full sentences over compressed noun phrases: "convenience module", not
+   "a `mirrored_supervisor`-shaped convenience"
  * State guarantees explicitly: "only one instance can run in the cluster
    at any given time", not "becomes a cluster-wide singleton"
  * Write "Erlang/OTP", never bare "OTP"
- * Spell jargon out: "ownership moves to another node" or "leadership
-   (ownership) transfer", not "failover"
- * Avoid "singleton" where "the child", "the elected child", or an
-   explicit one-instance phrasing reads naturally
+ * Spell jargon out: "ownership moves to another node", not "failover";
+   avoid "singleton" where "the child" or a one-instance phrasing works
  * No "term — explanation" em-dash glosses: use ": " or parentheses
- * These vocabulary rules apply to identifiers too: test case names,
-   helper module names, and test lock-key atoms
-   (`crash_promotes_standby`, not `crash_failover_promotes_standby`;
-   `{election, X}` keys, not `{singleton, X}`)
+ * These rules apply to identifiers too: `crash_promotes_standby`, not
+   `crash_failover_promotes_standby`; `{election, X}` keys, not
+   `{singleton, X}`
 
 ### Writing and Markdown Style
 
  * Never add full stops to Markdown list items
- * Use "X and Y" in prose, not "X / Y" slash-shorthand. Exceptions: unit
-   fractions (`bytes/edge`), single-concept abbreviations (`I/O`), and paths
-   or code (`tests/unit/`, `m:f/a`, `queue.declare`)
- * Wrap code identifiers (types, functions, modules, file names, paths)
-   in backticks in prose
- * Avoid robotic labels such as `**Thing / other:**`; write a plain
-   sentence or a simple label
- * Match the existing conventions of the file and subdirectory you are
-   editing: bullet character, heading depth, ID schemes, and table shape
-   vary by project, and the local choice wins
+ * Use "X and Y" in prose, not "X / Y". Exceptions: unit fractions
+   (`bytes/edge`), abbreviations (`I/O`), and paths or code (`tests/unit/`,
+   `m:f/a`, `queue.declare`)
+ * Wrap code identifiers (types, functions, modules, paths) in backticks
+ * No robotic labels like `**Thing / other:**`; write a plain sentence
+ * Match the conventions of the file you are editing: bullets, heading
+   depth, ID schemes, and table shape vary, and the local choice wins
 
 ## Git
 
- * Never add yourself to the list of commit co-authors
- * Never mention yourself in commit messages in any way
- * Do not commit changes automatically without explicit permission
+ * Never add yourself as a commit co-author
+ * Never mention yourself in commit messages
+ * Do not commit without explicit permission
