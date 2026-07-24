@@ -18,10 +18,10 @@ transfer.
 
 It is a thin layer built on top of `portunus_registry`: `start_link/3,4` reads
 the desired children from `init/1` once and registers each one, and returns
-the underlying `portunus_registry` pid. The fixed child set fixes only what
-runs, not where it runs, so `which_children/1` reports what this node runs and
-`transfer/3` hands a child to a chosen node, the same deliberate rebalancing
-that dynamic children get. Both take the returned handle, which is a
+the underlying `portunus_registry` pid. The fixed child set determines only what
+runs, not where it runs. This means that `which_children/1` reports what this
+node currently runs, and `transfer/3` hands a child to a chosen node. This is
+the same deliberate rebalancing that dynamic children get. Both take the returned handle, which is a
 `portunus_registry`, so its other operations act on it too. The registry owns
 the local supervisor, so the whole tree shares one lifetime and nothing is
 leaked or orphaned. Children are namespaced by group (the

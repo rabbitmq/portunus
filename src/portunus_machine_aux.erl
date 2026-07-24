@@ -26,10 +26,14 @@ The rules match the etcd lessor:
  * a term change means another leader renewed these holders in between,
    so both maps are cleared first
 
-Every function takes the applied leases as a view
+Every function takes the applied leases as a `lease_view()` map
 (`#{lease_id() => {ttl_ms, refreshed}}`), the current Raft term and a
-caller-supplied monotonic `now`. This keeps the decisions testable
-without a Ra cluster. `portunus_machine:handle_aux/5` extracts the
+caller-supplied monotonic `now`.
+
+This means that the decisions can be tested
+without a Ra cluster.
+
+`portunus_machine:handle_aux/5` extracts the
 inputs and turns the outputs into effects.
 """.
 
@@ -62,9 +66,10 @@ non_leader_tick(#aux{term = Term}) ->
     #aux{term = Term}.
 
 -doc """
-As the name suggests, this function is called periodically.
-Reconciles the term, drops entries for leases the
-machine no longer holds, seeds untracked leases at their full TTL, then
+As the name suggests, this function is called on every leader tick.
+
+Reconciles the term, drops entries for leases
+the machine no longer holds, seeds untracked leases at their full TTL, then
 proposes expiry for every deadline at or past `Now` that doesn't already have
 a live proposal.
 
@@ -93,8 +98,9 @@ leader_tick(Aux0, Leases, Term, Now) ->
      Pairs}.
 
 -doc """
-Renews each lease the machine still holds and that has no live expiry
-proposal. A lease with a live proposal answers `lease_expired` even
+Renews each lease the machine still holds that has no live expiry proposal.
+
+A lease with a live proposal answers `lease_expired` even
 though the command has not applied yet. The appended command may still
 expire it, so acknowledging the renewal would be wrong.
 """.
@@ -117,9 +123,12 @@ renew(Aux0, Leases, Term, Now, LeaseIds) ->
       end, {Aux1, []}, LeaseIds).
 
 -doc """
-A grant committed, initial or an idempotent re-grant. Extends the aux
-deadlines to the full TTL so a re-granted lease whose old deadline had
-passed is not proposed for expiry right after a successful grant.
+Called once a `grant_lease` command has been committed, whether it created the
+lease or was a repeat grant by the same owner.
+
+Resets each granted lease's
+aux deadline to a full TTL (`Now + Ttl`) so that a lease whose old deadline
+had already passed is not removed as expired right after its grant succeeded.
 """.
 -spec refreshed(aux(), lease_view(), non_neg_integer(), integer(),
                 [portunus:lease_id()]) -> aux().

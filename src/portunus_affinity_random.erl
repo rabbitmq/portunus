@@ -18,6 +18,6 @@ does not affect determinism. For a *stable* even spread prefer
 -spec kind() -> dynamic.
 kind() -> dynamic.
 
-%% A wide range keeps ties rare; a tie falls back to FIFO.
+%% The range is wide, so ties are rare; a tie falls back to FIFO.
 -spec score(term(), [node()], term()) -> pos_integer().
 score(_Key, _Members, _Args) -> rand:uniform(1 bsl 30).

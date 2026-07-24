@@ -43,7 +43,8 @@ TTL of the last renewal.
                 round = idle :: idle | reference()}).
 
 -record(state, {groups = #{} :: #{group_key() => #group{}},
-                %% Lock owner monitor to its lease, for O(1) 'DOWN' handling.
+                %% Maps each lock owner's monitor to its lease, so a `'DOWN'`
+                %% message is handled in O(1).
                 mons = #{} :: #{reference() => {group_key(), portunus:lease_id()}}}).
 
 -spec start_link() -> {ok, pid()} | {error, term()}.

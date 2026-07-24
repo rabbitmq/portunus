@@ -72,7 +72,9 @@ on external resources.
 start_link(Name, Key, Mod, Args) ->
     start_link(Name, Key, Mod, Args, #{}).
 
-%% The `ttl_ms` floor is the renewer's (see `portunus_keepalive`).
+%% The `ttl_ms` floor is `?MIN_RENEWABLE_TTL_MS`, defined in `portunus.hrl`.
+%% A lease has to be renewable well within its TTL, so the renewer requires
+%% this minimum.
 -spec start_link(portunus:name(), portunus:lock_key(), module(), term(),
                  election_opts()) ->
     {ok, pid()} | {error, term()}.
@@ -212,9 +214,9 @@ handle_info({portunus, lease_lost, LeaseId},
     {noreply, lose_and_recontend(State)};
 handle_info({'DOWN', Mon, process, _Pid, _Reason},
             #state{renewer_mon = Mon} = State) ->
-    %% The lease stays valid for TTL since (after) its last renewal.
-    %% If the renewer fails, the owner process re-monitors. The resource ownership
-    %% is not lost.
+    %% The lease stays valid for one TTL after its last renewal.
+    %% If the renewer fails, the owner process re-monitors, so resource
+    %% ownership is not lost.
     %%
     %% If the lease expired before such re-attachment could take place,
     %% the next round delivers `lease_lost`.

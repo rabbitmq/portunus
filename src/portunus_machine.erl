@@ -12,11 +12,12 @@ tokens, and a score-ordered succession queue (FIFO among equal scores).
 Key decisions:
 
 1. `apply/3` never reads node-local time, only the leader-stamped `system_time` in the command metadata.
-2. Never uses `make_ref/0`, `self/0`, and derives tokens and IDs from the Raft
-   log `index`, packed with a per-incarnation (think restarts) epoch (see `token_info/1`)
+2. Never uses `make_ref/0` or `self/0`. Instead it derives tokens and IDs
+   from the Raft log `index`, packed with a per-incarnation epoch (think
+   restarts; see `token_info/1`).
 
-This main goal of having per-incarnation epochs is to make sure
-that higher epochs result in higher fencing tokens produced.
+The main goal of having per-incarnation epochs is to make sure
+that higher epochs result in higher fencing tokens being produced.
 
 Lease renewal and expiry timing live off the Raft log, in per-server aux
 state (see `portunus_machine_aux`): renewals arrive over

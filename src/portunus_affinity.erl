@@ -16,8 +16,9 @@ Two strategies are supported:
  * `deterministic`: a pure function of the key and the cluster members,
     so every node computes the same ranking. Built-in variants: `fifo`, `pinned`,
     `preferred`, `hash`
-  * `dynamic`: a node scores itself from local dynamically calculated state
-    such as metrics (load, resource consumption, etc). Built-in variants: `metric`, `random`
+  * `dynamic`: a node scores itself from local state that it calculates
+    dynamically, such as metrics (load, resource consumption, and so on).
+    Built-in variants: `metric`, `random`
 
 Affinity strategies are passed around as a `spec()` that carries a short
 name (`fifo`, `pinned`, `random`, and so on). To use a custom module,

@@ -7,7 +7,7 @@
 -module(portunus_affinity_hash).
 -moduledoc """
 Rendezvous (highest-random-weight) hashing: each node scores its weight
-for the key, the highest wins. Keys spread evenly across members, and a
+for the key, and the highest wins. Keys spread evenly across members, and a
 membership change only moves the keys that hashed to the gained or lost
 node. `Args` is ignored. `phash2/1` is portable, so every node agrees.
 """.

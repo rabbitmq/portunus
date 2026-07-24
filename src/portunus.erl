@@ -186,7 +186,7 @@ start_system(System, DataDir) ->
                    data_dir => DataDir,
                    %% `default_config/0` points this at `ra_env:data_dir/0`,
                    %% another system's directory under a host such as RabbitMQ.
-                   %% Ra recovers every `*.wal` in a directory whoever wrote it,
+                   %% Ra recovers every `*.wal` in a directory no matter who wrote it,
                    %% and deletes the ones whose UID it does not know.
                    wal_data_dir => DataDir,
                    server_recovery_strategy => registered,
@@ -842,7 +842,7 @@ elect_or_join(System, Name, Members, ServerId, LocalMembers) ->
             end
     end.
 
-%% Asks the seed if given node is its cluster member. If not,
+%% Asks the seed whether a given node is one of its cluster members. If not,
 %% resets the node, then joins the seed.
 merge_into_seed(System, Name, Seed, ServerId) ->
     case ra:members({Name, Seed}, ?CMD_TIMEOUT) of
