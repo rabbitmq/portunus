@@ -139,7 +139,13 @@ inject({delete_replica_dir, Node}, Config) ->
     UId = rpc:call(Node, ra_directory, uid_of, [?SYS, ?NAME]),
     ok = rpc:call(Node, ra_system, stop, [?SYS]),
     case is_binary(UId) of
-        true -> ok = file:del_dir_r(filename:join(Dir, UId));
+        %% An earlier round may already have removed this replica's
+        %% directory. The test expects that we are starting from a clean slate.
+        true ->
+            case file:del_dir_r(filename:join(Dir, UId)) of
+                ok -> ok;
+                {error, enoent} -> ok
+            end;
         false -> ok
     end,
     ok = rpc:call(Node, portunus_ct_cluster, start_host_system, [?SYS, Dir]),
