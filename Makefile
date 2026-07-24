@@ -3,7 +3,7 @@ PROJECT_DESCRIPTION = A Raft-based lock server for the Erlang ecosystem
 PROJECT_VERSION = 0.12.0
 PROJECT_MOD = portunus_app
 
-dep_ra = hex 3.1.9
+dep_ra = hex 3.1.10
 dep_seshat = hex 1.0.1
 DEPS = ra seshat
 
