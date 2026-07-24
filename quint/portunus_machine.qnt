@@ -18,9 +18,14 @@
 // promotes that contender and no other, catching a mutant that falls back to
 // the best-ranked one.
 //
-// `expireBatch` models one command revoking several leases at once: a tick
-// catching several expiries, or one pid's death revoking every lease it
-// held. Every token minted by one command carries that command's single
+// `expireBatch` models one command revoking several leases at once: an
+// `{expire_leases, ...}` command from the leader's aux sweep, or one pid's
+// death revoking every lease it held. Lease renewal is off the Raft log
+// (leader aux state) and never changes key ownership, so it has no action
+// here; the sweep's `refreshed` fence races are covered by
+// `portunus_aux_renewal_prop_SUITE`. Letting `expireBatch` revoke any
+// subset of live leases over-approximates what a fenced sweep can commit.
+// Every token minted by one command carries that command's single
 // Raft index, and a queued successor can itself be among the revoked: a
 // fixed machine bug promoted such a successor and then re-promoted the
 // freed key, minting two equal tokens for successive owners of one key.
@@ -200,8 +205,9 @@ module portunus_machine {
     transferMisdirected' = transferMisdirected,
   }
 
-  // One command revokes the whole set `ls`: a tick catching several
-  // expiries, or one pid's death revoking every lease it held. Freed keys
+  // One command revokes the whole set `ls`: an `{expire_leases, ...}`
+  // command from the aux sweep, or one pid's death revoking every lease it
+  // held. Freed keys
   // promote the best-ranked candidate, skipping the command's own revoking
   // leases; every mint carries the command's one index, so a
   // second grant for the same key would re-mint an equal token: exactly

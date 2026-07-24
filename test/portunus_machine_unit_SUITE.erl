@@ -66,7 +66,9 @@ expiry_releases_keys_and_promotes(_Config) ->
     {{ok, _}, S3, _} = at({acquire, l1, k2, o1, undefined, nowait}, 3, 0, S2),
     {{ok, l2}, S4, _} = at({grant_lease, l2, 100000, o2, P2}, 4, 0, S3),
     {{queued, 1}, S5, _} = at({acquire, l2, k1, o2, undefined, wait}, 5, 0, S4),
-    {ok, S6, Effs} = at({timeout, expire}, 6, 200, S5),
+    {ok, S6, Effs} = at({expire_leases,
+                     portunus_test_helpers:expire_pairs(S5, 0, 200)},
+                    6, 200, S5),
     {ok, #{owner := o2}} = portunus_machine:query_owner(k1, S6),
     {error, not_held} = portunus_machine:query_owner(k2, S6),
     ?assertNotEqual(false, grant_token(Effs, P2, k1)).
@@ -86,7 +88,9 @@ multi_lease_expiry_releases_all(_Config) ->
                                       ix({a, L}), 0, S),
                                Next
                        end, Granted, Grants),
-    {ok, Swept, _} = at({timeout, expire}, 99, 200, Held),
+    {ok, Swept, _} = at({expire_leases,
+                     portunus_test_helpers:expire_pairs(Held, 0, 200)},
+                    99, 200, Held),
     [?assertEqual({error, not_held}, portunus_machine:query_owner(K, Swept))
      || {_L, K, _O} <- Grants].
 
@@ -97,7 +101,9 @@ fencing_after_expiry_and_regrant(_Config) ->
     S0 = new(),
     {{ok, la}, S1, _} = at({grant_lease, la, 100, oa, dummy_pid()}, 1, 0, S0),
     {{ok, T1}, S2, _} = at({acquire, la, k, oa, undefined, nowait}, 2, 0, S1),
-    {ok, S3, _} = at({timeout, expire}, 3, 200, S2),
+    {ok, S3, _} = at({expire_leases,
+                  portunus_test_helpers:expire_pairs(S2, 0, 200)},
+                 3, 200, S2),
     {{ok, lb}, S4, _} = at({grant_lease, lb, 100000, ob, dummy_pid()}, 4, 300, S3),
     {{ok, T2}, S5, _} = at({acquire, lb, k, ob, undefined, nowait}, 5, 300, S4),
     ?assert(T2 > T1),
@@ -122,17 +128,20 @@ replay_is_deterministic(_Config) ->
            {{acquire, l2, k1, o2, undefined, wait}, 4, 0},
            {{acquire, l1, k2, o1, undefined, nowait}, 5, 0},
            {{release, k1, 3}, 6, 0},
-           {{timeout, expire}, 7, 5000}],
+           %% l2's fence is its grant index; expiry releases its promoted key.
+           {{expire_leases, [{l2, 2}]}, 7, 5000}],
     ?assertEqual(replay(Log), replay(Log)).
 
-%% An idempotent re-grant by the same owner moves the deadline out, so a tick
-%% past the original deadline but before the new one does not expire the lease.
+%% An idempotent re-grant by the same owner changes the lease's `refreshed`
+%% index, so an expiry proposal fenced with the pre-re-grant index is skipped
+%% and the lease survives.
 re_grant_refreshes_the_deadline(_Config) ->
     S0 = new(),
     {{ok, l}, S1, _} = at({grant_lease, l, 1000, o, dummy_pid()}, 1, 0, S0),
     {{ok, _}, S2, _} = at({acquire, l, k, o, undefined, nowait}, 2, 0, S1),
+    StalePairs = portunus_test_helpers:expire_pairs(S2, 0, 2000),
     {{ok, l}, S3, _} = at({grant_lease, l, 5000, o, dummy_pid()}, 3, 100, S2),
-    {_, S4, _} = at({timeout, expire}, 4, 2000, S3),
+    {ok, S4, _} = at({expire_leases, StalePairs}, 4, 2000, S3),
     ?assertMatch({ok, #{owner := o}}, portunus_machine:query_owner(k, S4)).
 
 %% Membership signals are observational: they never change lock state.

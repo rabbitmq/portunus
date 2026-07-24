@@ -49,6 +49,8 @@ command_gen() ->
            {leave_queue, Field, Field},
            {watch, Field, Field},
            {unwatch, Field},
+           {expire_leases, list({Field, Field})},
+           {expire_leases, Field},
            {timeout, expire},
            {down, Field, Field},
            {nodeup, Field},

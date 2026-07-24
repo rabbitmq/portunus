@@ -20,7 +20,6 @@
          watch_events/1,
          unwatch_prunes/1,
          release_errors/1,
-         batch_renew_mixed/1,
          expiry/1]).
 
 all() ->
@@ -32,7 +31,6 @@ all() ->
      watch_events,
      unwatch_prunes,
      release_errors,
-     batch_renew_mixed,
      expiry].
 
 grant_acquire_release(_Config) ->
@@ -121,18 +119,14 @@ release_errors(_Config) ->
     %% A stale token does not release the current holder.
     {{error, not_owner}, _} = bare_step({release, k, T + 1}, 4, S3).
 
-batch_renew_mixed(_Config) ->
-    S0 = new(),
-    {{ok, l1}, S1, _} = step({grant_lease, l1, 1000, o, self()}, 1, S0),
-    {Results, _S2, _} = step({renew, [l1, missing]}, 2, S1),
-    ?assertEqual([{l1, ok}, {missing, {error, lease_expired}}], Results).
-
 expiry(_Config) ->
     %% Grant at t=0 with a 100ms TTL, sweep at t=200: the lease is gone.
     S0 = new(),
     {{ok, l1}, S1, _} = apply_at({grant_lease, l1, 100, o, self()}, 1, 0, S0),
     {{ok, _T}, S2, _} = apply_at({acquire, l1, k, o, undefined, nowait}, 2, 0, S1),
-    {ok, S3, _} = apply_at({timeout, expire}, 3, 200, S2),
+    {ok, S3, _} = apply_at({expire_leases,
+                        portunus_test_helpers:expire_pairs(S2, 0, 200)},
+                       3, 200, S2),
     {error, not_held} = portunus_machine:query_owner(k, S3).
 
 %%----------------------------------------------------------------------

@@ -8,9 +8,10 @@
 -module(portunus_api_SUITE).
 
 %% The finalized public API: `acquire/4` tries once and never
-%% queues, `acquire_or_join_succession_queue` queues, `owner/2` reports a
-%% `remaining_ms`, a missing renew is `lease_expired`, and a watch ref
-%% round-trips.
+%% queues, `acquire_or_join_succession_queue` queues, `owner/2` carries no
+%% `remaining_ms` (the operative deadline lives in leader aux state and has
+%% no truthful replicated source), a missing renew is `lease_expired`, and
+%% a watch ref round-trips.
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -18,7 +19,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([acquire_tries_once/1,
          join_queue_waits/1,
-         owner_reports_remaining_ttl/1,
+         owner_omits_remaining_ttl/1,
          context_round_trips_through_owner/1,
          renew_missing_is_lease_expired/1,
          watch_ref_round_trips/1,
@@ -29,7 +30,7 @@
 -define(TTL, 60000).
 
 all() ->
-    [acquire_tries_once, join_queue_waits, owner_reports_remaining_ttl,
+    [acquire_tries_once, join_queue_waits, owner_omits_remaining_ttl,
      context_round_trips_through_owner, renew_missing_is_lease_expired,
      watch_ref_round_trips, is_member_reports_membership].
 
@@ -71,13 +72,13 @@ is_member_reports_membership(_Config) ->
     %% No local replica exists for a cluster that was never started here.
     ?assertNot(portunus:is_member(portunus_api_no_such_cluster)).
 
-owner_reports_remaining_ttl(_Config) ->
+owner_omits_remaining_ttl(_Config) ->
     K = {res, ttl},
     {ok, L} = portunus:grant_lease(?NAME, ?TTL),
     {ok, _} = portunus:acquire(?NAME, K, L, owner_a),
     {ok, Info} = portunus:owner(?NAME, K),
-    Remaining = maps:get(remaining_ms, Info),
-    ?assert(is_integer(Remaining) andalso Remaining > 0 andalso Remaining =< ?TTL),
+    ?assertNot(is_map_key(remaining_ms, Info)),
+    ?assertMatch(#{owner := owner_a, lease := L}, Info),
     ok = portunus:revoke_lease(?NAME, L).
 
 context_round_trips_through_owner(_Config) ->

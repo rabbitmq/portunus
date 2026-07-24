@@ -91,6 +91,11 @@ joiner_serves_from_installed_snapshot(Config) ->
     ok = portunus:revoke_lease(?NAME, L2),
     Holder ! stop.
 
-spin_commands(Name, Lease, N) ->
-    [[{Lease, ok}] = portunus:renew_leases(Name, [Lease]) || _ <- lists:seq(1, N)],
+%% Renewals no longer append (they travel over the aux transport), so
+%% grant-and-revoke pairs drive the log instead.
+spin_commands(Name, _Lease, N) ->
+    [begin
+         {ok, Ln} = portunus:grant_lease(Name, 60000),
+         ok = portunus:revoke_lease(Name, Ln)
+     end || _ <- lists:seq(1, N div 2 + 1)],
     ok.

@@ -866,10 +866,8 @@ maybe_trigger_single_member_election(_ServerId, _Members) ->
 %% Set both identically on every node: `init/1` stores them in replicated
 %% state.
 machine(Name) ->
-    Tick = application:get_env(portunus, tick_interval_ms, 1000),
     SnapInterval = application:get_env(portunus, snapshot_interval, 4096),
     {module, portunus_machine, #{cluster => Name,
-                                 tick_interval_ms => Tick,
                                  snapshot_interval => SnapInterval}}.
 
 -doc """
@@ -1080,13 +1078,23 @@ renew_leases(Name, LeaseIds) ->
 -doc """
 Renew with an explicit command timeout. A renewer bounds this to a fraction
 of the TTL so several attempts fit within one TTL across a leader change.
+
+Renewals are not written to the Raft log: they travel over
+`ra:consistent_aux/3` and move an in-memory deadline in the leader's aux
+state.
+
+A failure or timeout means the lease is possibly lost: the holder must
+stand down.
 """.
 -spec renew_leases(name(), [lease_id()], timeout()) ->
     [{lease_id(), ok | {error, lease_expired | no_quorum}}].
 renew_leases(Name, LeaseIds, Timeout) when is_list(LeaseIds) ->
-    case cmd(Name, {renew, LeaseIds}, Timeout) of
-        {error, no_quorum} -> [{L, {error, no_quorum}} || L <- LeaseIds];
-        Results -> Results
+    case ra:consistent_aux(leader_or_local(Name), {renew, LeaseIds}, Timeout) of
+        {ok, Results, _Leader} when is_list(Results) ->
+            Results;
+        Other ->
+            _ = no_online_quorum(Name, Other),
+            [{L, {error, no_quorum}} || L <- LeaseIds]
     end.
 
 -doc "Revoke a lease and release every lock held under it.".

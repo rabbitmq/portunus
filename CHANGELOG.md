@@ -1,6 +1,30 @@
 ## Changes in `0.11.0` (in development)
 
-No changes yet.
+### Breaking or Potentially Breaking Changes
+
+ * A leader change can extend every outstanding lease by up to one full TTL:
+   the new leader does not know the old leader's renewal bookkeeping, so it
+   errs toward late expiry (the same trade `etcd` makes). At-most-one-owner
+   is unaffected; only reclaim latency after a holder's ungraceful death
+   grows across a leader change
+
+ * `owner_info()` (returned by `portunus:owner/2`) no longer carries
+   `remaining_ms`. Its source of truth was the replicated deadline, which no
+   longer exists; a decaying lower bound would mislead
+
+ * The `tick_interval_ms` application setting was removed. Lease expiry is now noticed
+   within one Ra `tick_timeout` (1 s by default) of the lease's deadline
+
+### Enhancements
+
+ * Lease renewal moved off the Raft log. Renewals now travel over
+   `ra:consistent_aux/3`: the leader confirms a live quorum with a
+   heartbeat round and moves the lease's deadline in its in-memory (aux)
+   state, so steady-state renewal appends nothing to the log and triggers no
+   `fsync(2)` on any member. The periodic `{timeout, expire}` sweep command
+   is gone too; the leader's aux tick proposes an `{expire_leases, ...}`
+   command only when a lease actually expired, so a healthy cluster holding
+   leases has a zero background write rate
 
 
 ## Changes in `0.10.0` (Jul 22, 2026)

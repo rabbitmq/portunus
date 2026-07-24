@@ -15,7 +15,7 @@
 //
 // quint typecheck quint/portunus_registry.qnt
 // quint run       quint/portunus_registry.qnt --invariants no_orphan child_fenced fenced_single_owner tokens_bounded
-// quint run       quint/portunus_registry.qnt --witnesses lease_window failover_complete
+// quint run       quint/portunus_registry.qnt --witnesses lease_window handover_complete
 
 module portunus_registry {
   import basicSpells.* from "spells/basicSpells"
@@ -49,7 +49,7 @@ module portunus_registry {
     role: Role,
     // Registry-node fields.
     entry: Entry,
-    // local singleton child running
+    // the elected child is running locally
     child: bool,
     // current lease id, 0 means "none"
     lease: int,
@@ -376,7 +376,7 @@ module portunus_registry {
       (reg(n).entry == Absent and not(reg(n).child) and reg(n).lease == 0))
 
   // A running child is always the fenced elected child: entry present, lease
-  // and token held. Any path that leaves the singleton running after its
+  // and token held. Any path that leaves the child running after its
   // election is gone fails here.
   val child_fenced = REGS.forall(n =>
     reg(n).child implies
@@ -403,8 +403,9 @@ module portunus_registry {
 
   // Witness: the lease-expiry dual-run window — a node still runs the fenced
   // child, its LeaseLost sits undelivered, and the machine has already
-  // granted past its lease. This is the documented gap TTL failover accepts;
-  // the fencing token, not the notification, protects external writes.
+  // granted past its lease. This is the documented gap TTL-based ownership
+  // transfer accepts; the fencing token, not the notification, protects
+  // external writes.
   val lease_window = REGS.exists(n => and {
     reg(n).child,
     reg(n).token != 0,
@@ -416,7 +417,7 @@ module portunus_registry {
   // Witness: a second-or-later grant is installed and running fenced — an
   // earlier owner was released and superseded (by another node, or by the
   // same node on a fresh lease).
-  val failover_complete = REGS.exists(n => and {
+  val handover_complete = REGS.exists(n => and {
     holds_unexempted(n),
     machine.owner == n,
     reg(n).token >= 2,
@@ -428,7 +429,7 @@ module portunus_registry {
 
   // Grant to "a", queue "b", expire "a": "b" is promoted on a fresh token and
   // "a" steps down on the LeaseLost.
-  run failover_test = init
+  run succession_test = init
     .then(step_with("a", contend))
     .then(step_with(MACHINE, on_acquire))
     .then(step_with("a", receive_grant))

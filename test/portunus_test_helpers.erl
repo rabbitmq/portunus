@@ -16,7 +16,8 @@
 -export([await_condition/1, await_condition/2,
          await_leader/1, await_leader/2,
          await_registered/2,
-         meta/1, meta/2, quickcheck/2]).
+         meta/1, meta/2, quickcheck/2,
+         expire_pairs/3]).
 
 %% A valid `ra_machine:command_meta_data()` for driving `portunus_machine:apply/3`
 %% directly in a test. The contract requires `term` even though the machine
@@ -28,6 +29,19 @@ meta(Index) ->
 -spec meta(non_neg_integer(), non_neg_integer()) -> ra_machine:command_meta_data().
 meta(Index, SystemTime) ->
     #{index => Index, system_time => SystemTime, term => 1}.
+
+%% The expire pairs a leader sweep would propose for `State`: one tick at
+%% `SeedNow` seeds every lease at its full TTL, a second at `Now` proposes
+%% the ones whose deadline passed. Feed the pairs to `apply/3` as
+%% `{expire_leases, Pairs}` to drive expiry in a direct-apply test.
+-spec expire_pairs(portunus_machine:state(), integer(), integer()) ->
+    [portunus_machine_aux:expire_pair()].
+expire_pairs(State, SeedNow, Now) ->
+    View = portunus_machine:lease_view(State),
+    {Aux, []} = portunus_machine_aux:leader_tick(portunus_machine_aux:new(),
+                                                 View, 1, SeedNow),
+    {_, Pairs} = portunus_machine_aux:leader_tick(Aux, View, 1, Now),
+    Pairs.
 
 %% Run a PropEr property given as a nullary fun. Going through `erlang:apply/2`
 %% hands `proper:quickcheck/2` a plain term rather than the opaque

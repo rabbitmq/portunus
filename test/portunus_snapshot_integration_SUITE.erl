@@ -44,8 +44,13 @@ state_survives_snapshot_recovery(_Config) ->
     Key = {res, snapshot},
     {ok, L} = portunus:grant_lease(?NAME, 60000, #{proposed_id => snap_lease}),
     {ok, T1} = portunus:acquire(?NAME, Key, L, owner_a),
-    %% Enough commands to cross ra's 4096-entry snapshot floor.
-    [[{L, ok}] = portunus:renew_leases(?NAME, [L]) || _ <- lists:seq(1, 4500)],
+    %% Enough logged commands to cross ra's 4096-entry snapshot floor.
+    %% Renewals no longer append (they travel over the aux transport), so
+    %% grant-and-revoke pairs drive the log instead.
+    [begin
+         {ok, Ln} = portunus:grant_lease(?NAME, 60000),
+         ok = portunus:revoke_lease(?NAME, Ln)
+     end || _ <- lists:seq(1, 2300)],
     ok = portunus_test_helpers:await_condition(
            fun() ->
                    KM = ra:key_metrics({?NAME, node()}),

@@ -8,8 +8,9 @@
 
 %% A model-based property over the whole lease lifecycle, driving `apply/3`
 %% against a reference model. Where `portunus_machine_prop` checks acquire and
-%% release, this interleaves grant, renew, revoke, and monitor-driven `down`
-%% as well, so cross-command paths (release_pid, multi-key revoke) are
+%% release, this interleaves grant, revoke, monitor-driven `down`, and
+%% fenced `expire_leases` (matching and stale fences alike), so cross-command
+%% paths (release_pid, multi-key revoke, sweep-proposed expiry) are
 %% exercised together. Waiter succession is covered in
 %% `portunus_succession_prop_SUITE`; this run uses `nowait` acquires only.
 
@@ -28,7 +29,7 @@ lifecycle_safety(_Config) ->
     true = portunus_test_helpers:quickcheck(
              fun prop_lifecycle_preserves_safety/0, 500).
 
-%% However grant, renew, revoke, down, acquire, and release interleave, the
+%% However grant, revoke, down, acquire, release, and expire interleave, the
 %% machine keeps at most one owner per key, fencing tokens that never go
 %% backwards, and no key held by a lease that is gone.
 prop_lifecycle_preserves_safety() ->
@@ -48,12 +49,13 @@ prop_lifecycle_preserves_safety() ->
 
 op() ->
     oneof([{grant, oneof(?LEASES)},
-           {renew, oneof(?LEASES)},
            {revoke, oneof(?LEASES)},
            {down, oneof(?LEASES)},
            {down_noconn, oneof(?LEASES)},
            {acquire, oneof(?LEASES), oneof(?KEYS)},
-           {release, oneof(?LEASES), oneof(?KEYS)}]).
+           {release, oneof(?LEASES), oneof(?KEYS)},
+           {expire, oneof(?LEASES)},
+           {expire_stale, oneof(?LEASES)}]).
 
 run([], _Ix, S, Model, _Pids, Ok) ->
     {S, Model, Ok};
@@ -66,12 +68,29 @@ step({grant, L}, Ix, S0, M0, Pids) ->
     {_, S1} = apply_cmd({grant_lease, L, ?BIG_TTL, {o, L}, maps:get(L, Pids)},
                         Ix, S0),
     {S1, M0#{leases := maps:put(L, true, maps:get(leases, M0))}};
-step({renew, L}, Ix, S0, M0, _Pids) ->
-    {_, S1} = apply_cmd({renew, [L]}, Ix, S0),
-    {S1, M0};
 step({revoke, L}, Ix, S0, M0, _Pids) ->
     {_, S1} = apply_cmd({revoke_lease, L}, Ix, S0),
     {S1, forget_lease(L, M0)};
+%% The aux sweep's proposal with a matching fence: the lease is revoked.
+step({expire, L}, Ix, S0, M0, _Pids) ->
+    case maps:get(L, portunus_machine:lease_view(S0), undefined) of
+        undefined ->
+            {_, S1} = apply_cmd({expire_leases, [{L, 0}]}, Ix, S0),
+            {S1, M0};
+        {_Ttl, Fence} ->
+            {_, S1} = apply_cmd({expire_leases, [{L, Fence}]}, Ix, S0),
+            {S1, forget_lease(L, M0)}
+    end;
+%% A proposal outrun by a logged refresh: the stale fence must be skipped
+%% and the lease survives.
+step({expire_stale, L}, Ix, S0, M0, _Pids) ->
+    case maps:get(L, portunus_machine:lease_view(S0), undefined) of
+        undefined ->
+            {S0, M0};
+        {_Ttl, Fence} ->
+            {_, S1} = apply_cmd({expire_leases, [{L, Fence + 1}]}, Ix, S0),
+            {S1, M0}
+    end;
 step({down, L}, Ix, S0, M0, Pids) ->
     {_, S1} = apply_cmd({down, maps:get(L, Pids), normal}, Ix, S0),
     {S1, forget_lease(L, M0)};

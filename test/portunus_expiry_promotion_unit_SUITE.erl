@@ -67,7 +67,9 @@ expire_chain() ->
     {{queued, _}, S5, _} = step({acquire, l2, k, o2, undefined, wait, 0}, 5, 0, S4),
     {{queued, _}, S6, _} = step({acquire, l3, k, o3, undefined, wait, 0}, 6, 0, S5),
     {{ok, _}, S7, _} = step({watch, k, self()}, 7, 0, S6),
-    {ok, S8, Effects} = step({timeout, expire}, 8, 5000, S7),
+    {ok, S8, Effects} = step({expire_leases,
+                          portunus_test_helpers:expire_pairs(S7, 0, 5000)},
+                         8, 5000, S7),
     {S8, Effects}.
 
 grants_of(Key, Effects) ->

@@ -7,21 +7,18 @@
 -module(portunus_release_cursor_unit_SUITE).
 
 %% Log growth is bounded: every `snapshot_interval` entries the machine
-%% emits a release cursor so Ra can snapshot and truncate, and the expiry
-%% timer runs only while leases exist, so an idle cluster stops appending
-%% a tick entry every second.
+%% emits a release cursor so Ra can snapshot and truncate. The machine
+%% never arms timers: expiry runs through the aux sweep on Ra's tick.
 
 -include_lib("eunit/include/eunit.hrl").
 
 -export([all/0]).
 -export([release_cursor_emitted_at_interval/1,
-         expiry_timer_runs_only_while_leases_exist/1,
-         leader_arms_timer_only_with_leases/1]).
+         no_timers_are_ever_armed/1]).
 
 all() ->
     [release_cursor_emitted_at_interval,
-     expiry_timer_runs_only_while_leases_exist,
-     leader_arms_timer_only_with_leases].
+     no_timers_are_ever_armed].
 
 release_cursor_emitted_at_interval(_Config) ->
     S0 = portunus_machine:init(#{snapshot_interval => 5}),
@@ -40,43 +37,28 @@ release_cursor_emitted_at_interval(_Config) ->
     {ok_reply, S10, Effs10} = noop(10, S9),
     [{release_cursor, 10, S10}] = cursors(Effs10).
 
-expiry_timer_runs_only_while_leases_exist(_Config) ->
+no_timers_are_ever_armed(_Config) ->
     S0 = portunus_machine:init(#{}),
-    %% The first lease arms the timer; the second does not re-arm.
     {{ok, l1}, S1, E1} = step({grant_lease, l1, 1000, o1, undefined}, 1, 0, S0),
-    ?assert(has_timer(E1)),
-    {{ok, l2}, S2, E2} = step({grant_lease, l2, 1000, o2, undefined}, 2, 0, S1),
-    ?assertNot(has_timer(E2)),
-    %% A tick that leaves leases behind re-arms; one that empties does not.
-    {ok, S3, E3} = step({timeout, expire}, 3, 500, S2),
-    ?assert(has_timer(E3)),
-    {ok, S4, E4} = step({timeout, expire}, 4, 5000, S3),
-    ?assertNot(has_timer(E4)),
-    %% The next grant arms an idle machine again.
-    {{ok, l3}, _S5, E5} = step({grant_lease, l3, 1000, o3, undefined}, 5, 6000, S4),
-    ?assert(has_timer(E5)).
-
-leader_arms_timer_only_with_leases(_Config) ->
-    S0 = portunus_machine:init(#{}),
-    ?assertNot(has_timer(portunus_machine:state_enter(leader, S0))),
-    {{ok, l1}, S1, _} = step({grant_lease, l1, 1000, o1, undefined}, 1, 0, S0),
-    ?assert(has_timer(portunus_machine:state_enter(leader, S1))).
+    ?assertNot(has_timer(E1)),
+    ?assertNot(has_timer(portunus_machine:state_enter(leader, S1))).
 
 %%----------------------------------------------------------------------
 %% Helpers
 %%----------------------------------------------------------------------
 
-%% An empty renew: a legal command that changes nothing, to advance the index.
+%% A membership signal: a legal command that changes nothing, to advance
+%% the index.
 noop(Ix, S) ->
-    {S1, [], Effs} = portunus_machine:apply(portunus_test_helpers:meta(Ix),
-                                            {renew, []}, S),
+    {S1, ok, Effs} = portunus_machine:apply(portunus_test_helpers:meta(Ix),
+                                            {nodeup, node()}, S),
     {ok_reply, S1, Effs}.
 
 cursors(Effs) ->
     [E || {release_cursor, _, _} = E <- Effs].
 
 has_timer(Effs) ->
-    lists:any(fun({timer, expire, _}) -> true;
+    lists:any(fun({timer, _, _}) -> true;
                  (_) -> false
               end, Effs).
 

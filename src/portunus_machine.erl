@@ -7,8 +7,7 @@
 -module(portunus_machine).
 -moduledoc """
 The `portunus` Ra state machine. It manages leases, locks, fencing
-tokens, a score-ordered succession queue (FIFO among equal scores), and
-tick-based lease expiry.
+tokens, and a score-ordered succession queue (FIFO among equal scores).
 
 Key decisions:
 
@@ -18,6 +17,18 @@ Key decisions:
 
 This main goal of having per-incarnation epochs is to make sure
 that higher epochs result in higher fencing tokens produced.
+
+Lease renewal and expiry timing live off the Raft log, in per-server aux
+state (see `portunus_machine_aux`): renewals arrive over
+`ra:consistent_aux/3` and move an in-memory deadline on the leader, and
+the leader's aux tick proposes `{expire_leases, ...}` commands for leases
+whose deadline passed. Replicated state keeps, per lease, only the
+`refreshed` index of the last logged command that refreshed it (its
+grant, initial or idempotent); an expiry proposal is fenced with that
+index, so a proposal outrun by a re-grant is skipped by `apply/3`.
+Steady-state renewal therefore appends nothing and triggers no `fsync(2)`
+on any member. The trade-off, the same one etcd makes: a leader change can
+extend a lease by up to one full TTL (late expiry only, never early).
 """.
 
 -behaviour(ra_machine).
@@ -27,9 +38,7 @@ that higher epochs result in higher fencing tokens produced.
          state_enter/2,
          init_aux/1,
          handle_aux/5,
-         overview/1,
-         version/0,
-         which_module/1]).
+         overview/1]).
 
 %% Exported for queries run via `ra:consistent_query/3` or `ra:local_query/3`.
 -export([query_owner/2,
@@ -38,7 +47,10 @@ that higher epochs result in higher fencing tokens produced.
 
 -export([token_info/1]).
 
--define(DEFAULT_TICK_MS, 1000).
+%% For testing of
+%% `portunus_machine_aux` without a Ra cluster.
+-export([lease_view/1]).
+
 -define(DEFAULT_SNAPSHOT_INTERVAL, 4096).
 %% Client-facing identifiers are `(Epoch bsl ?EPOCH_SHIFT) + Index`; 64 bits
 %% holds any real log's index.
@@ -51,8 +63,7 @@ that higher epochs result in higher fencing tokens produced.
 -type watch_ref() :: non_neg_integer().
 -type owner() :: term().
 -type owner_info() :: #{owner := owner(), lease := lease_id(),
-                        token := token(), context := term(),
-                        remaining_ms := non_neg_integer()}.
+                        token := token(), context := term()}.
 
 %% Fencing tokens are *not* opaque by design: a client fences an external
 %% write by comparing them.
@@ -62,7 +73,6 @@ that higher epochs result in higher fencing tokens produced.
 -type command() ::
         {grant_lease, portunus:option(lease_id()), pos_integer(), owner(),
          portunus:option(pid())} |
-        {renew, [lease_id()]} |
         {revoke_lease, lease_id()} |
         {acquire, lease_id(), lock_key(), owner(), term(), wait | nowait} |
         {acquire, lease_id(), lock_key(), owner(), term(), wait | nowait,
@@ -72,7 +82,7 @@ that higher epochs result in higher fencing tokens produced.
         {leave_queue, lock_key(), lease_id()} |
         {watch, lock_key(), pid()} |
         {unwatch, watch_ref()} |
-        {timeout, expire} |
+        {expire_leases, [portunus_machine_aux:expire_pair()]} |
         {down, pid(), term()} |
         {nodeup | nodedown, node()}.
 
@@ -93,15 +103,18 @@ that higher epochs result in higher fencing tokens produced.
                  score = 0 :: integer(),
                  seq = 0 :: non_neg_integer()}).
 
+%% `refreshed` is the Raft index of the last logged command that refreshed
+%% the lease (its grant, initial or idempotent); the aux sweep fences its
+%% expiry proposals with it. The operative deadline lives in leader aux
+%% state.
 -record(lease, {id :: lease_id(),
                 ttl_ms :: pos_integer(),
-                deadline :: integer(),
+                refreshed = 0 :: ra:index(),
                 owner :: owner(),
                 pid :: portunus:option(pid()),
                 keys = #{} :: #{lock_key() => #held_lock{}}}).
 
 -record(?MODULE, {cluster :: atom(),
-                  tick_ms = ?DEFAULT_TICK_MS :: pos_integer(),
                   snapshot_interval = ?DEFAULT_SNAPSHOT_INTERVAL :: pos_integer(),
                   %% the Raft index of the last release cursor
                   last_release = 0 :: non_neg_integer(),
@@ -134,11 +147,10 @@ that higher epochs result in higher fencing tokens produced.
 
 %% Ra merges `name` and `machine_version` into the init args, so the
 %% callback must accept the wider machine-init map (it carries `cluster`
-%% and `tick_interval_ms` from the cluster's machine config).
+%% from the cluster's machine config).
 -spec init(map()) -> state().
 init(Config) ->
     #?MODULE{cluster = maps:get(cluster, Config, portunus),
-             tick_ms = maps:get(tick_interval_ms, Config, ?DEFAULT_TICK_MS),
              snapshot_interval = maps:get(snapshot_interval, Config,
                                           ?DEFAULT_SNAPSHOT_INTERVAL)}.
 
@@ -183,62 +195,53 @@ maybe_release_cursor(#{index := Index}, Ret) ->
 do_apply(Meta, {grant_lease, ProposedId, TtlMs, Owner, Pid}, State0)
   when is_integer(TtlMs), TtlMs > 0,
        (Pid =:= undefined orelse is_pid(Pid)) ->
-    Now = now_ms(Meta),
     LeaseId = case ProposedId of
                   undefined -> packed_index(Meta, State0);
                   _ -> ProposedId
               end,
+    %% Both grant outcomes are logged refreshes: they stamp `refreshed` and
+    %% extend the leader's aux deadline. Without the extension, a re-granted
+    %% lease whose old aux deadline had passed would be proposed for expiry
+    %% on the next tick, seconds after a successful grant.
+    Refreshed = refreshed_effect([LeaseId]),
     case maps:find(LeaseId, State0#?MODULE.leases) of
         {ok, #lease{owner = Owner} = L} ->
-            %% Idempotent re-grant by the same owner: refresh the deadline,
+            %% Idempotent re-grant by the same owner: refresh the lease,
             %% re-arming the monitor lost to a `noconnection`. The command's
             %% pid is ignored: through the public API the owner is the pid,
             %% so a same-owner re-grant always carries the same pid.
-            L1 = L#lease{deadline = Now + TtlMs, ttl_ms = TtlMs},
+            L1 = L#lease{refreshed = index(Meta), ttl_ms = TtlMs},
             {State1, Effs} =
                 ensure_monitor(L#lease.pid,
                                set_lease(LeaseId, L1, State0), []),
-            {State1, {ok, LeaseId}, Effs};
+            {State1, {ok, LeaseId}, Refreshed ++ Effs};
         {ok, #lease{}} ->
             {State0, {error, id_in_use}};
         error ->
-            L = #lease{id = LeaseId, ttl_ms = TtlMs, deadline = Now + TtlMs,
-                       owner = Owner, pid = Pid},
+            L = #lease{id = LeaseId, ttl_ms = TtlMs,
+                       refreshed = index(Meta), owner = Owner, pid = Pid},
             State1 = add_lease_pid(Pid, LeaseId, set_lease(LeaseId, L, State0)),
             {State2, Effs} = ensure_monitor(Pid, State1, []),
-            %% The expiry timer runs only while leases exist (an idle cluster
-            %% must not log one tick per second forever); the first lease
-            %% arms it. A same-name timer effect resets a pending one.
-            Timer = case map_size(State0#?MODULE.leases) of
-                        0 -> [{timer, expire, State2#?MODULE.tick_ms}];
-                        _ -> []
-                    end,
-            {State2, {ok, LeaseId}, Timer ++ Effs}
+            {State2, {ok, LeaseId}, Refreshed ++ Effs}
     end;
-do_apply(Meta, {renew, LeaseIds}, State0) when is_list(LeaseIds) ->
-    Now = now_ms(Meta),
-    %% Renewal re-arms the monitor: `{down, noconnection}` drops the
-    %% `monitored` entry, and a holder that keeps renewing after the
-    %% reconnect is otherwise never re-monitored until a leader change.
-    {State1, Results, MonEffs} =
-        lists:foldl(
-          fun(LeaseId, {S, Acc, Effs}) ->
-                  case maps:find(LeaseId, S#?MODULE.leases) of
-                      {ok, L} ->
-                          L1 = L#lease{deadline = Now + L#lease.ttl_ms},
-                          {S1, Effs1} =
-                              ensure_monitor(L#lease.pid,
-                                             set_lease(LeaseId, L1, S), Effs),
-                          {S1, [{LeaseId, ok} | Acc], Effs1};
-                      error ->
-                          {S, [{LeaseId, {error, lease_expired}} | Acc], Effs}
-                  end
-          end, {State0, [], []}, LeaseIds),
-    Effs = case lists:keymember(ok, 2, Results) of
-               true -> [incr(renewals_total, State1) | MonEffs];
-               false -> MonEffs
-           end,
-    {State1, lists:reverse(Results), Effs};
+%% The aux sweep's expiry proposal. Each pair is fenced with the `refreshed`
+%% index the sweep read from applied state: a re-grant that committed after
+%% the sweep changed that index, so a mismatching pair is skipped and the
+%% live lease survives; the rest of the batch still applies.
+do_apply(Meta, {expire_leases, Pairs}, State0) when is_list(Pairs) ->
+    Expired = lists:usort(
+                [Id || {Id, Fence} <- Pairs,
+                       case maps:find(Id, State0#?MODULE.leases) of
+                           {ok, #lease{refreshed = Fence}} -> true;
+                           _ -> false
+                       end]),
+    Notices = lease_lost_msgs(Expired, State0),
+    {State1, Effs} = revoke_leases(Meta, Expired, State0),
+    ExpEff = case Expired of
+                 [] -> [];
+                 _ -> [incr(lease_expiries_total, State1)]
+             end,
+    {State1, ok, Notices ++ Effs ++ ExpEff};
 do_apply(Meta, {revoke_lease, LeaseId}, State0) ->
     {State1, Effs} = revoke_lease(Meta, LeaseId, #{LeaseId => true}, State0),
     {State1, ok, Effs};
@@ -326,35 +329,12 @@ do_apply(_Meta, {unwatch, Ref}, State0) ->
                             {S1, E1 ++ E}
                     end, {State1, []}, lists:usort(Dropped)),
     {State2, ok, Effs};
-do_apply(Meta, {timeout, expire}, State0) ->
-    Now = now_ms(Meta),
-    %% Sorted so the revocation order is a pure function of replicated
-    %% state, never of map iteration order, which can vary across versions.
-    Expired = lists:sort(
-                [LeaseId || {LeaseId, #lease{deadline = D}} <-
-                                maps:to_list(State0#?MODULE.leases), D =< Now]),
-    %% No client initiated this loss, so the deposed holder is
-    %% told directly instead of waiting out a renew interval. `local`
-    %% delivers through the member on the holder's node, which may be the
-    %% only path when the holder expired because it cannot reach the leader.
-    Notices = lease_lost_msgs(Expired, State0),
-    {State1, Effs} = revoke_leases(Meta, Expired, State0),
-    ExpEff = case Expired of
-                 [] -> [];
-                 _ -> [incr(lease_expiries_total, State1)]
-             end,
-    %% Re-arm only while leases remain; the next grant re-arms an idle
-    %% machine.
-    Timer = case map_size(State1#?MODULE.leases) of
-                0 -> [];
-                _ -> [{timer, expire, State1#?MODULE.tick_ms}]
-            end,
-    {State1, ok, Notices ++ Effs ++ ExpEff ++ Timer};
 %% Unreachable, not dead: the lease still decides. The cross-node monitor
-%% auto-cleared with the connection, so drop the stale monitored entry; a later
-%% grant, renew or watch re-arms it. A watch-only pid has no renewal path, so
-%% its monitor comes back only at the next leader change, acceptable for
-%% best-effort watches.
+%% auto-cleared with the connection, so drop the stale monitored entry; a
+%% later grant or watch re-arms it, and everything else is re-monitored at
+%% the next leader change. Renewals are aux-side and cannot re-arm; a holder
+%% that dies inside that window is still bounded by lease expiry, since the
+%% monitor is only the fast path.
 do_apply(_Meta, {down, Pid, noconnection}, State0) ->
     {State0#?MODULE{monitored = maps:remove(Pid, State0#?MODULE.monitored)}, ok};
 %% A genuine local death: release the pid's leases (the monitor fast-path).
@@ -364,7 +344,8 @@ do_apply(Meta, {down, Pid, _Reason}, State0) ->
 do_apply(_Meta, {nodeup, _Node}, State0) ->
     {State0, ok};
 do_apply(_Meta, {nodedown, _Node}, State0) ->
-    %% Unreachable, not dead. Leases expire via the tick if not renewed.
+    %% Unreachable, not dead. Leases expire via the aux sweep if not
+    %% renewed.
     {State0, ok};
 do_apply(_Meta, _Unknown, State0) ->
     {State0, {error, unknown_command}}.
@@ -372,43 +353,102 @@ do_apply(_Meta, _Unknown, State0) ->
 -spec state_enter(ra_server:ra_state() | eol, state()) ->
     ra_machine:effects().
 state_enter(leader, State) ->
-    %% A new leader re-derives its monitors from replicated state, and arms
-    %% the expiry timer only if there are leases to expire.
+    %% A new leader re-derives its monitors from replicated state. No expiry
+    %% timer: the aux sweep runs on Ra's tick and seeds its deadlines from
+    %% this state.
     Mons = [{monitor, process, P} || P <- known_pids(State)],
-    Timer = case map_size(State#?MODULE.leases) of
-                0 -> [];
-                _ -> [{timer, expire, State#?MODULE.tick_ms}]
-            end,
     Cluster = State#?MODULE.cluster,
-    Mons ++ Timer ++ [incr(leader_changes_total, State),
-                      set_gauge(Cluster, is_leader, 1)];
+    Mons ++ [incr(leader_changes_total, State),
+             set_gauge(Cluster, is_leader, 1)];
 state_enter(_, _State) ->
     %% No demotion gauge here: Ra runs `mod_call` effects only on the leader,
     %% so it would be dropped. The aux tick publishes `is_leader` per node
     %% and clears a deposed leader's within a tick.
     [].
 
--spec init_aux(atom()) -> undefined.
+-spec init_aux(atom()) -> portunus_machine_aux:aux().
 init_aux(_Name) ->
-    undefined.
+    portunus_machine_aux:new().
 
-%% Runs on every member each tick (the per-member `{aux, tick}`), so each node
-%% publishes its own gauges from its own replica rather than reading zero.
-%% This cadence is Ra's `tick_timeout` (1000 ms), not the machine's
-%% `tick_interval_ms`, which drives only the lease expiry sweep.
--spec handle_aux(ra_server:ra_state(), term(), term(), undefined,
+%% The per-member `{aux, tick}` runs on every member on Ra's `tick_timeout`
+%% (1000 ms) with no log write: each node publishes its own gauges from its
+%% own replica, and the leader also runs the expiry sweep. The renewal and
+%% sweep decisions are pure functions in `portunus_machine_aux`; this
+%% callback extracts their inputs and turns their outputs into effects.
+-spec handle_aux(ra_server:ra_state(), term(), term(),
+                 portunus_machine_aux:aux(),
                  ra_aux:internal_state()) ->
-    {no_reply, undefined, ra_aux:internal_state()}.
-handle_aux(_RaState, _Type, tick, Aux, RaAux) ->
+    {no_reply, portunus_machine_aux:aux(), ra_aux:internal_state()} |
+    {no_reply, portunus_machine_aux:aux(), ra_aux:internal_state(),
+     ra_machine:effects()} |
+    {reply, term(), portunus_machine_aux:aux(), ra_aux:internal_state()}.
+handle_aux(RaState, _Type, tick, Aux0, RaAux) ->
     %% Publishing metrics must never crash the Ra server, so it is best-effort.
     _ = try
-            Mac = ra_aux:machine_state(RaAux),
-            portunus_counters:set_gauges(Mac#?MODULE.cluster, node_gauges(Mac, RaAux))
+            Mac0 = ra_aux:machine_state(RaAux),
+            portunus_counters:set_gauges(Mac0#?MODULE.cluster,
+                                         node_gauges(Mac0, RaAux))
         catch _:_ -> ok
         end,
+    case RaState of
+        leader ->
+            Mac = ra_aux:machine_state(RaAux),
+            {Aux, Pairs} =
+                portunus_machine_aux:leader_tick(Aux0, lease_view(Mac),
+                                                 ra_aux:current_term(RaAux),
+                                                 mono_ms()),
+            Effs = case Pairs of
+                       [] -> [];
+                       _ -> [{append, {expire_leases, Pairs}, noreply}]
+                   end,
+            {no_reply, Aux, RaAux, Effs};
+        _ ->
+            {no_reply, portunus_machine_aux:non_leader_tick(Aux0), RaAux}
+    end;
+%% The renewal transport (`ra:consistent_aux/3`). Ra runs it on the
+%% leader after a heartbeat round confirmed a live quorum, so an `ok` here
+%% is as trustworthy as a committed command's reply. Aux state is not
+%% replicated, so monotonic time is fine here; the determinism rules apply
+%% to `apply/3` only.
+handle_aux(leader, _Type, {renew, LeaseIds}, Aux0, RaAux)
+  when is_list(LeaseIds) ->
+    Mac = ra_aux:machine_state(RaAux),
+    {Aux, Results} =
+        portunus_machine_aux:renew(Aux0, lease_view(Mac),
+                                   ra_aux:current_term(RaAux),
+                                   mono_ms(), LeaseIds),
+    %% Bumped directly, not as an effect: aux runs only live, never in
+    %% replay, and only on this node.
+    case lists:keymember(ok, 2, Results) of
+        true -> portunus_counters:incr(Mac#?MODULE.cluster, renewals_total);
+        false -> ok
+    end,
+    {reply, Results, Aux, RaAux};
+%% Not the leader: a plain aux command could still land here, and a
+%% non-leader's aux state holds no operative deadlines. The client reads
+%% any non-list reply as a transient quorum failure.
+handle_aux(_RaState, _Type, {renew, LeaseIds}, Aux, RaAux)
+  when is_list(LeaseIds) ->
+    {reply, {error, not_leader}, Aux, RaAux};
+%% A grant committed: extend the aux deadlines to the full TTL. Emitted by
+%% `apply/3`, executed on the leader only, and never during replay.
+handle_aux(leader, _Type, {refreshed, LeaseIds}, Aux0, RaAux)
+  when is_list(LeaseIds) ->
+    Mac = ra_aux:machine_state(RaAux),
+    Aux = portunus_machine_aux:refreshed(Aux0, lease_view(Mac),
+                                         ra_aux:current_term(RaAux),
+                                         mono_ms(), LeaseIds),
     {no_reply, Aux, RaAux};
 handle_aux(_RaState, _Type, _Cmd, Aux, RaAux) ->
     {no_reply, Aux, RaAux}.
+
+%% The applied leases as the aux core's view.
+-spec lease_view(state()) -> portunus_machine_aux:lease_view().
+lease_view(#?MODULE{leases = Leases}) ->
+    #{Id => {L#lease.ttl_ms, L#lease.refreshed} || Id := L <- Leases}.
+
+mono_ms() ->
+    erlang:monotonic_time(millisecond).
 
 %% This node's gauge values: machine counts from its replica, Raft figures from
 %% the local server, membership from the cluster configuration.
@@ -466,12 +506,6 @@ token_info(Token) when is_integer(Token), Token >= 0 ->
     #{epoch => Token bsr ?EPOCH_SHIFT,
       index => Token band ((1 bsl ?EPOCH_SHIFT) - 1)}.
 
--spec version() -> ra_machine:version().
-version() -> 0.
-
--spec which_module(ra_machine:version()) -> module().
-which_module(0) -> ?MODULE.
-
 %%----------------------------------------------------------------------
 %% Query funs (run on a replica via `ra:consistent_query/3` or `ra:local_query/3`)
 %%----------------------------------------------------------------------
@@ -484,12 +518,7 @@ query_owner(LockKey, State) ->
             Lease = maps:get(LeaseId, State#?MODULE.leases),
             #held_lock{token = T, owner = O, context = C} =
                 maps:get(LockKey, Lease#lease.keys),
-            %% Remaining TTL is liveness, so a node-local clock read in a query
-            %% (never in `apply/3`) is acceptable; it is approximate.
-            Remaining = max(0, Lease#lease.deadline -
-                                erlang:system_time(millisecond)),
-            {ok, #{owner => O, lease => LeaseId, token => T, context => C,
-                   remaining_ms => Remaining}};
+            {ok, #{owner => O, lease => LeaseId, token => T, context => C}};
         error ->
             {error, not_held}
     end.
@@ -523,6 +552,11 @@ index(Meta) -> maps:get(index, Meta).
 %% waiter `seq` stays a raw index: it never leaves one incarnation's state.
 packed_index(Meta, #?MODULE{epoch = Epoch}) ->
     (Epoch bsl ?EPOCH_SHIFT) + index(Meta).
+
+%% Ra runs `{aux, ...}` effects on the leader only, and replay never runs
+%% effects, so a recovering leader falls back to the sweep's seeding.
+refreshed_effect(LeaseIds) ->
+    [{aux, {refreshed, LeaseIds}}].
 
 set_lease(LeaseId, Lease, State) ->
     State#?MODULE{leases = maps:put(LeaseId, Lease, State#?MODULE.leases)}.

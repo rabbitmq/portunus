@@ -6,18 +6,16 @@
 %%
 -module(portunus_batch_keepalive).
 -moduledoc """
-Renews multiple leases in a single Ra command per round,
-reducing the `fsync(2)` intensity with a lot of processes
-that use automatic lease renewal.
+Renews multiple leases in a single renewal round, for nodes with a lot
+of processes that use automatic lease renewal.
 
 `portunus_keepalive` gives every holder its own renewer, so a node with N
-leases sends N renewal commands every TTL/3. Each command is a Raft log append
-fsynced by every member. That can be a lot of `fsync(2)`s per second to
-cause meaningful I/O throughput degradation.
+leases sends N renewal calls every TTL/3, each a leader round trip with a
+quorum heartbeat.
 
 This module is one registered process per node
 that holders attach leases to; leases sharing a `{ClusterName, TTL}` pair renew
-together in a single `portunus:renew_leases/3` command, so the write rate
+together in a single `portunus:renew_leases/3` call, so the rate
 is per node, not per lease.
 
 Resource owner processes monitor it and

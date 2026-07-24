@@ -43,7 +43,10 @@ end_per_suite(_Config) ->
 expiry_sweep_notifies_the_holder(_Config) ->
     S0 = portunus_machine:init(#{}),
     {S1, {ok, l1}, _} = apply_at({grant_lease, l1, 1000, o, self()}, 1, 0, S0),
-    {_S2, ok, Effects} = apply_at({timeout, expire}, 2, 5000, S1),
+    {_S2, ok, Effects} =
+        apply_at({expire_leases,
+                  portunus_test_helpers:expire_pairs(S1, 0, 5000)},
+                 2, 5000, S1),
     ?assert(lists:member({send_msg, self(),
                           {portunus, lease_lost, l1}, [local]}, Effects)).
 

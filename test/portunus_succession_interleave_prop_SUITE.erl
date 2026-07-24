@@ -97,8 +97,13 @@ step({leave, L, K}, Ix, S0, M0, _Pids) ->
             {S1, M0}
     end;
 step({expire}, Ix, S0, M0, _Pids) ->
-    {_, S1} = apply_cmd({timeout, expire}, Ix, S0),
+    %% The sweep is aux-side now; the model builds the expiry pairs itself,
+    %% as the leader would, fenced with each lease's current `refreshed`.
+    View = portunus_machine:lease_view(S0),
     Expired = [L || {L, D} <- maps:to_list(maps:get(live, M0)), D =< Ix],
+    Pairs = [{L, Fence} || L <- Expired,
+                           {_Ttl, Fence} <- [maps:get(L, View, undefined)]],
+    {_, S1} = apply_cmd({expire_leases, Pairs}, Ix, S0),
     {S1, lists:foldl(fun drop_lease/2, M0, Expired)}.
 
 %% A live lease claims a key. `nowait` claims only a free key (a busy key is a
