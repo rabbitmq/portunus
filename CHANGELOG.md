@@ -1,4 +1,9 @@
-## Changes in `0.11.0` (in development)
+## Changes in `0.12.0` (in development)
+
+No changes yet.
+
+
+## Changes in `0.11.0` (Jul 23, 2026)
 
 ### Breaking or Potentially Breaking Changes
 
