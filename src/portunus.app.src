@@ -1,6 +1,6 @@
 {application,portunus,
              [{description,"A Raft-based lock server for the Erlang ecosystem"},
-              {vsn,"0.11.0"},
+              {vsn,"0.12.0"},
               {licenses,["Apache-2.0","MPL-2.0"]},
               {links,[{"github","https://github.com/rabbitmq/portunus"}]},
               {modules,[]},
