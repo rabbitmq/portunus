@@ -14,8 +14,8 @@ No changes yet.
    grows across a leader change
 
  * `owner_info()` (returned by `portunus:owner/2`) no longer carries
-   `remaining_ms`. Its source of truth was the replicated deadline, which no
-   longer exists; a decaying lower bound would mislead
+   `remaining_ms`. Its source of truth was the replicated deadline, which
+   was removed
 
  * The `tick_interval_ms` application setting was removed. Lease expiry is now noticed
    within one Ra `tick_timeout` (1 s by default) of the lease's deadline
