@@ -32,8 +32,8 @@ smoother integration with RabbitMQ and caters to the habits of the RabbitMQ Core
 
 ## Dependencies
 
- * `ra` (3.1.x) — Raft engine and the `ra_machine` behaviour
- * `seshat` (1.x) — counters registry for metrics
+ * `ra` (3.1.x): Raft engine and the `ra_machine` behaviour
+ * `seshat` (1.x): counters registry for metrics
 
 No other runtime deps. Transport, identity, and TLS come from the Erlang
 distribution.
