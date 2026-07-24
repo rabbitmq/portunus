@@ -106,6 +106,15 @@ prose: design docs, analyses, notes, and commit messages.
    "a `mirrored_supervisor`-shaped convenience"
  * State guarantees explicitly: "only one instance can run in the cluster
    at any given time", not "becomes a cluster-wide singleton"
+ * Spell the causation out with a plain connective: "this means that the
+   decisions can be tested without a cluster", not the compressed "keeps
+   the decisions testable"
+ * One idea per paragraph: in multi-line doc strings, separate distinct
+   thoughts with a blank line rather than cramming them into one block
+ * A short orienting connective is fine where it helps the reader ("as the
+   name suggests", "note that"): this is clarity, not flourish
+ * Grammar counts, including the passive where it is the correct voice: "a
+   command has been committed", not "a command has committed"
  * Write "Erlang/OTP", never bare "OTP"
  * Spell jargon out: "ownership moves to another node", not "failover";
    avoid "singleton" where "the child" or a one-instance phrasing works

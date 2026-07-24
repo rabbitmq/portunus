@@ -6,31 +6,31 @@
 %%
 -module(portunus_machine_aux).
 -moduledoc """
-The pure decision core behind `portunus_machine`'s aux renewal and expiry
-sweep. Aux state is per-server and in-memory, never replicated, so lease
-renewal writes nothing to the Raft log; only expiry, an actual state
-change, becomes a logged `{expire_leases, ...}` command.
+Pure decision logic for `portunus_machine`'s aux renewal and expiry sweep.
+Aux state is per-server, in-memory and never replicated. Renewal writes
+nothing to the Raft log. Only expiry becomes a logged
+`{expire_leases, ...}` command.
 
-The rules, the same ones the etcd lessor uses:
+The rules match the etcd lessor:
 
- * the operative deadline of every lease lives here, on the leader, in
-   monotonic time; renewal moves it forward without touching the log
- * a lease known to the machine but absent from `deadlines` is seeded at
-   its full TTL, so a new leader, a restarted server, and a fresh grant
+ * every lease's operative deadline lives here, on the leader, in
+   monotonic time. Renewal moves it forward without touching the log
+ * a lease known to the machine but missing from `deadlines` is seeded
+   at its full TTL. A new leader, a restarted server and a fresh grant
    all err toward late expiry, never early
- * an expiry proposal carries the lease's `refreshed` index as a fence;
-   while the machine still holds the lease with that exact index the
-   proposal is live, renewals for the lease answer `lease_expired`, and
-   the sweep does not re-propose it. Anything that changes `refreshed`
-   (or removes the lease) voids the entry
+ * an expiry proposal carries the lease's `refreshed` index as a fence.
+   While the machine still holds the lease at that exact index, the
+   proposal is live: renewals answer `lease_expired` and the sweep does
+   not re-propose. Anything that changes `refreshed` or removes the
+   lease voids the entry
  * a term change means another leader renewed these holders in between,
-   so both maps are cleared before anything else
+   so both maps are cleared first
 
 Every function takes the applied leases as a view
-(`#{lease_id() => {ttl_ms, refreshed}}`), the current Raft term, and a
-caller-supplied monotonic `now`, so the decisions are testable without a
-Ra cluster; `portunus_machine:handle_aux/5` extracts the inputs and turns
-the outputs into effects.
+(`#{lease_id() => {ttl_ms, refreshed}}`), the current Raft term and a
+caller-supplied monotonic `now`. This keeps the decisions testable
+without a Ra cluster. `portunus_machine:handle_aux/5` extracts the
+inputs and turns the outputs into effects.
 """.
 
 -export([new/0,
@@ -40,10 +40,9 @@ the outputs into effects.
          refreshed/5]).
 
 -record(aux, {term :: non_neg_integer() | undefined,
-              %% operative deadlines, in the caller's monotonic milliseconds
+              %% deadlines in the caller's monotonic milliseconds
               deadlines = #{} :: #{portunus:lease_id() => integer()},
-              %% expiry proposals in flight: lease id to the `refreshed`
-              %% index the proposal was fenced with
+              %% in-flight expiry proposals, fenced by `refreshed` index
               pending = #{} :: #{portunus:lease_id() => ra:index()}}).
 
 -opaque aux() :: #aux{}.
@@ -57,18 +56,20 @@ the outputs into effects.
 new() ->
     #aux{}.
 
--doc "A non-leader holds no operative deadlines: clear both maps.".
+-doc "A non-leader holds no deadlines. Clears both maps.".
 -spec non_leader_tick(aux()) -> aux().
 non_leader_tick(#aux{term = Term}) ->
     #aux{term = Term}.
 
 -doc """
-The leader sweep: reconcile the term, drop entries for leases the machine
-no longer holds and void pending entries, seed leases not yet tracked at
-their full TTL, then propose expiry for every deadline at or past `Now`
-that has no live proposal. Returns the expire pairs to append as one
-`{expire_leases, ...}` command; pairs are sorted so tests see a stable
-order.
+As the name suggests, this function is called periodically.
+Reconciles the term, drops entries for leases the
+machine no longer holds, seeds untracked leases at their full TTL, then
+proposes expiry for every deadline at or past `Now` that doesn't already have
+a live proposal.
+
+Returns the pairs to append as one `{expire_leases, ...}`
+command. Pairs are sorted so that tests observe a stable order.
 """.
 -spec leader_tick(aux(), lease_view(), non_neg_integer(), integer()) ->
     {aux(), [expire_pair()]}.
@@ -92,11 +93,10 @@ leader_tick(Aux0, Leases, Term, Now) ->
      Pairs}.
 
 -doc """
-Renew each lease the machine still holds and that has no live expiry
-proposal. A lease with a live proposal answers `lease_expired` (the
-standard possible-loss answer) even though the command has not applied
-yet: the appended command may still expire it, so acknowledging the
-renewal would be wrong.
+Renews each lease the machine still holds and that has no live expiry
+proposal. A lease with a live proposal answers `lease_expired` even
+though the command has not applied yet. The appended command may still
+expire it, so acknowledging the renewal would be wrong.
 """.
 -spec renew(aux(), lease_view(), non_neg_integer(), integer(),
             [portunus:lease_id()]) ->
@@ -117,8 +117,8 @@ renew(Aux0, Leases, Term, Now, LeaseIds) ->
       end, {Aux1, []}, LeaseIds).
 
 -doc """
-A grant committed (initial or an idempotent re-grant): extend the aux
-deadlines to the full TTL, so a re-granted lease whose old deadline had
+A grant committed, initial or an idempotent re-grant. Extends the aux
+deadlines to the full TTL so a re-granted lease whose old deadline had
 passed is not proposed for expiry right after a successful grant.
 """.
 -spec refreshed(aux(), lease_view(), non_neg_integer(), integer(),
@@ -137,8 +137,8 @@ refreshed(Aux0, Leases, Term, Now, LeaseIds) ->
 %% Internal
 %%----------------------------------------------------------------------
 
-%% Deadlines from a previous leadership of this server are stale: the
-%% holders were renewing with the interim leader.
+%% Deadlines from a previous leadership of this server are stale.
+%% The holders were renewing with the interim leader.
 reconcile(#aux{term = Term} = Aux, Term) ->
     Aux;
 reconcile(_Aux, Term) ->

@@ -114,7 +114,7 @@ renew_moves_the_deadline(_Config) ->
     View = #{l1 => {100, 7}},
     {A1, []} = tick(new(), View, 0),
     {A2, [{l1, ok}]} = renew(A1, View, 90, [l1]),
-    %% Seeded deadline was 100; the renewal moved it to 190.
+    %% The seeded deadline was 100. The renewal moved it to 190.
     {A3, []} = tick(A2, View, 150),
     {_A4, [{l1, 7}]} = tick(A3, View, 190),
     ok.

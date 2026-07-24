@@ -13,15 +13,14 @@ of processes that use automatic lease renewal.
 leases sends N renewal calls every TTL/3, each a leader round trip with a
 quorum heartbeat.
 
-This module is one registered process per node
-that holders attach leases to; leases sharing a `{ClusterName, TTL}` pair renew
-together in a single `portunus:renew_leases/3` call, so the rate
-is per node, not per lease.
+This module is one registered process per node that holders attach
+leases to. Leases sharing a `{ClusterName, TTL}` pair renew together in
+a single `portunus:renew_leases/3` call, so the rate is per node, not
+per lease.
 
-Resource owner processes monitor it and
-re-attach should this process fail and restart.
-A lease survives such a failure scenario as long as the owner process
-re-attaches within a TTL of the last renewal.
+Resource owner processes monitor it and re-attach if it restarts. A
+lease survives the restart as long as the owner re-attaches within a
+TTL of the last renewal.
 """.
 
 -include("portunus.hrl").
@@ -111,8 +110,8 @@ handle_cast(_Msg, State) ->
 handle_info({renew, Key}, #state{groups = Groups} = State) ->
     case Groups of
         #{Key := #group{round = Ref}} when is_reference(Ref) ->
-            %% Stale timer from a dropped and re-created group; the result
-            %% handler arms the next one.
+            %% Stale timer from a dropped and re-created group. The
+            %% result handler arms the next one.
             {noreply, State};
         #{Key := #group{leases = Leases} = Group} when map_size(Leases) > 0 ->
             {ClusterName, TtlMs} = Key,
@@ -144,7 +143,7 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason},
             #state{groups = Groups, mons = Mons} = State) ->
     case maps:take(Ref, Mons) of
         {{Key, LeaseId}, Mons1} ->
-            %% A lock owner died; the machine's monitor releases its lease.
+            %% A lock owner died. The machine's monitor releases its lease.
             {noreply, remove_lease(Key, LeaseId,
                                    State#state{mons = Mons1})};
         error ->
@@ -170,9 +169,9 @@ terminate(_Reason, _State) ->
 %% Internal
 %%----------------------------------------------------------------------
 
-%% `transient` (a crashed helper or a non-list return) counts as no result
-%% for every lease; a lease attached mid-round has no result either and
-%% waits for the next round.
+%% `transient` (a crashed helper or a non-list return) counts as no
+%% result for every lease. A lease attached mid-round has no result
+%% either and waits for the next round.
 apply_results({_ClusterName, TtlMs} = Key, Results, State0) ->
     Now = now_ms(),
     ByLease = case Results of

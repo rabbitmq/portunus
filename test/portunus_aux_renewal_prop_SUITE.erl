@@ -13,7 +13,7 @@
 %% in-flight expiry proposals run against the pure aux core and the real
 %% `apply/3`, on a modeled clock. A lease must never be revoked while it is
 %% within its TTL of the last acknowledged promise (a grant `ok` or a renew
-%% `ok`); the `refreshed` fence and the pending set exist to close exactly
+%% `ok`). The `refreshed` fence and the pending set exist to close exactly
 %% the races the delayed-apply operations create.
 
 -include_lib("proper/include/proper.hrl").
@@ -67,7 +67,7 @@ step({grant, L, Ttl}, {S0, #{ix := Ix, now := Now} = M0}) ->
     M1 = M0#{ix := Ix + 1},
     case Reply of
         {ok, L} ->
-            %% The grant acknowledgment promises a full TTL; run the
+            %% The grant acknowledgment promises a full TTL. Run the
             %% `{aux, {refreshed, ...}}` effect the leader would.
             Aux = portunus_machine_aux:refreshed(
                     maps:get(aux, M1), portunus_machine:lease_view(S1),

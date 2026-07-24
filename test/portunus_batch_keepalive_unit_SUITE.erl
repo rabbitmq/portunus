@@ -69,8 +69,8 @@ group_renews_in_one_command_per_round(_Config) ->
     ?assert(Delta =< 12, {too_many_renew_commands, Delta}),
     [begin refute_lost(H, L), stop_holder(H) end || {H, L} <- Holders].
 
-%% A revoked lease is lost for its owner only; the other lease in the group
-%% keeps renewing.
+%% A revoked lease is lost for its owner only. The other lease in the
+%% group keeps renewing.
 expired_lease_notifies_only_its_holder(_Config) ->
     {Holder1, Lease1} = start_holder(),
     {Holder2, Lease2} = start_holder(),

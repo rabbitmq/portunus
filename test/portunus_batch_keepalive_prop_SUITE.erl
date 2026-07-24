@@ -10,8 +10,8 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1, attach_detach_balance/1]).
 
-%% Long enough that no renewal round fires during a run; the property then
-%% needs no Ra cluster.
+%% Long enough that no renewal round fires during a run. The property
+%% then needs no Ra cluster.
 -define(TTL, 60000).
 -define(NAME, batch_keepalive_prop).
 
@@ -26,8 +26,8 @@ init_per_suite(Config) ->
             unlink(Hub),
             [{hub, Hub} | Config];
         {error, {already_started, _}} ->
-            %% An earlier suite started the portunus application; its
-            %% supervised renewer serves as well.
+            %% An earlier suite started the portunus application. Its
+            %% supervised renewer works just as well.
             Config
     end.
 
@@ -58,14 +58,14 @@ prop_attach_detach_balance() ->
 op() ->
     {oneof([attach, detach, kill]), integer(1, 5)}.
 
-%% `Model`: leases the hub should be tracking; `Holders`: the last owner
-%% process spawned per lease id.
+%% `Model` holds the leases the renewer should be tracking. `Holders`
+%% holds the last owner process spawned per lease id.
 run_ops([], Model, Holders) ->
     {Model, Holders};
 run_ops([{attach, Id} | Ops], Model, Holders) ->
     H = spawn_holder(Id),
-    %% The renewer has already replaced the entry; the superseded owner is
-    %% just a leftover process.
+    %% The renewer has already replaced the entry. The superseded owner
+    %% is just a leftover process.
     case Holders of
         #{Id := Old} -> exit(Old, kill);
         _ -> ok
@@ -97,7 +97,7 @@ spawn_holder(Id) ->
     end,
     H.
 
-%% 'DOWN' processing races the check; poll briefly.
+%% 'DOWN' processing races the check. Poll briefly.
 await_attached(Expected) ->
     await_attached(Expected, 100).
 
