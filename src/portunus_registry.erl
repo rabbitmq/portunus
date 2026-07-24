@@ -16,7 +16,7 @@ an extended `{permanent, Delay}` restart option which `portunus_delayed_restart`
 rewrites) under a key; `portunus` runs one election per key, and the elected
 owner starts that child under a local Erlang/OTP supervisor.
 
-/remove/2` is the counterpart of `add/3`. A child is permanently removed
+`remove/2` is the counterpart of `add/3`. A child is permanently removed
 from the cluster once every node applies the change.
 
 `remove/2` on the owner alone moves the child to another node.
