@@ -1,6 +1,21 @@
-## Changes in `0.12.0` (in development)
+## Changes in `0.13.0` (in development)
 
 No changes yet.
+
+
+## Changes in `0.12.0` (Jul 25, 2026)
+
+### Enhancements
+
+ * Batched ownership transfer: `transfer_many/2` on `portunus`,
+   `portunus_registry` and `portunus_service` moves many keys in one Raft
+   command instead of one per key, so a rebalance pass costs a handful of
+   log entries (design doc `029`)
+
+ * `grant_lease` and both `acquire` commands are now pipelined
+   via `ra:pipeline_command/4` to handle command storms that happen
+   when an Erlang node that hosted thousands of lock owners is restarted
+   or rejoins after a network split.
 
 
 ## Changes in `0.11.0` (Jul 23, 2026)

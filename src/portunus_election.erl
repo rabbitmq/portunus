@@ -30,6 +30,7 @@ on external resources.
 -include("portunus.hrl").
 
 -export([start_link/4, start_link/5, is_leader/1, is_leader/2, transfer_to/2,
+         transfer_many/3, prepare_transfer/2, settle_transfer/2,
          stop/1, stop_all/1, stop_all/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -115,6 +116,59 @@ transfer_to(Pid, TargetNode) ->
     %% election surfaces as a timeout the caller retries, not an endless block.
     gen_server:call(Pid, {transfer_to, TargetNode}, 15000).
 
+-doc """
+Move several keys owned by this node to their targets in one batched command.
+This is `transfer_to/2`'s choreography run once for the whole batch instead of
+per key: prepare stops each key's local work and gathers its token, a single
+`portunus:transfer_many/2` command commits them all, and settle re-contends or
+restores each key from its per-item result.
+
+`KeyTargets` names, per key, the node it should move to. `LiveElections` maps
+each of this node's keys to its election pid, so the caller (a registry or a
+service) supplies only its own election map. Ahead of the command the pairs
+are deduplicated by key, a pair whose target is this node is `ok` without
+touching its election, and a key with no live election here is
+`{error, not_owner}`; a very large batch is chunked into bounded commands.
+Returns one `{Key, ok | {error, term()}}` per distinct key, in input order.
+""".
+%% `Key` is the caller's own key term (a registry or service key), not the
+%% namespaced lock key; the lock key is gathered from each election in prepare.
+-spec transfer_many(portunus:name(), [{Key, node()}], #{Key => pid()}) ->
+    [{Key, ok | {error, term()}}] when Key :: term().
+transfer_many(Name, KeyTargets, LiveElections) when is_list(KeyTargets) ->
+    Deduped = dedup_by_key(KeyTargets),
+    {Live, Immediate} = classify(Deduped, LiveElections),
+    Results = maps:from_list(chunked_transfer(Name, Live) ++ Immediate),
+    [{Key, maps:get(Key, Results)} || {Key, _Target} <- Deduped].
+
+-doc """
+Stop this election's local work for a planned transfer to `TargetNode` and
+return `{ok, LockKey, Token}` for the caller to commit in a batch. It runs
+`transfer_to/2`'s ready-contender pre-check first, so a not-ready target is
+refused with `{error, {no_contender, TargetNode}}` before any work stops, and
+a standby is `{error, not_owner}`.
+
+The election then keeps its lease renewing but stays a follower until
+`settle_transfer/2` (or, if none arrives, a reconciliation read) resolves who
+owns the key, so between prepare and settle the key runs on no node.
+""".
+-spec prepare_transfer(pid(), node()) ->
+    {ok, portunus:lock_key(), portunus:token()} |
+    {error, {no_contender, node()} | not_owner | no_quorum}.
+prepare_transfer(Pid, TargetNode) ->
+    gen_server:call(Pid, {prepare_transfer, TargetNode}, 15000).
+
+-doc """
+Hand a prepared election its committed per-item result: `ok` re-contends as a
+standby, `{error, {no_contender, _}}` restores the local work on the unchanged
+token, and `{error, not_owner}` re-contends because the lease lapsed during
+the command. A settle arriving after the election has already moved on (a
+`lease_lost`, or the reconciliation backstop) is a no-op.
+""".
+-spec settle_transfer(pid(), ok | {error, term()}) -> ok.
+settle_transfer(Pid, Result) ->
+    gen_server:cast(Pid, {settle_transfer, Result}).
+
 -spec stop(pid()) -> ok.
 stop(Pid) ->
     %% An already-stopped election is this call's goal state, not an error.
@@ -165,9 +219,22 @@ handle_call({transfer_to, TargetNode}, _From, #state{role = leader} = State) ->
 handle_call({transfer_to, _TargetNode}, _From, State) ->
     %% Only the elected owner can transfer; a standby is not the owner.
     {reply, {error, not_owner}, State};
+handle_call({prepare_transfer, TargetNode}, _From, #state{role = leader} = State) ->
+    do_prepare_transfer(TargetNode, State);
+handle_call({prepare_transfer, _TargetNode}, _From, State) ->
+    %% A standby is not the owner, and a second prepare (already a follower
+    %% awaiting settle) is refused the same way.
+    {reply, {error, not_owner}, State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
+handle_cast({settle_transfer, Result},
+            #state{pending_transfer = true} = State) ->
+    {noreply, do_settle_transfer(Result, State)};
+handle_cast({settle_transfer, _Result}, State) ->
+    %% The election already resolved the transfer itself (a `lease_lost`, or
+    %% the reconciliation backstop), so a late settle changes nothing.
+    {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -332,6 +399,62 @@ do_transfer_to(TargetNode, #state{name = Name, key = Key, token = Token,
             end
     end.
 
+%% The prepare half of a batched transfer: `do_transfer_to/2` up to but not
+%% including the command, which the caller now issues once for the whole batch.
+%% The pre-check refuses a not-ready target before any work stops, then
+%% `stepped_down` runs and the election becomes a follower that keeps its lease
+%% renewing. The `pending_transfer` flag carries the timed-out transfer's
+%% semantics (a stray grant is dropped, a `lease_lost` needs no second
+%% `stepped_down`), and the scheduled reconcile is the settle deadline: an
+%% election left prepared, by an orchestrator that died or a prepare reply that
+%% timed out, resolves ownership from the read instead of waiting forever.
+%%
+%% The deadline must outlive the orchestrator's whole choreography (the
+%% prepare fan-out bound plus the command timeout): the usual `ttl_ms div 3`
+%% reconcile could fire between prepare and commit, read this node as still
+%% owning, and restart the work the committing batch is about to move,
+%% running it on two nodes with no correction.
+do_prepare_transfer(TargetNode, #state{name = Name, key = Key, token = Token,
+                                       mod = Mod, cb_state = CbState} = State) ->
+    case is_ready_contender(Name, Key, TargetNode) of
+        false ->
+            _ = portunus_counters:incr(Name, transfer_no_contender_total),
+            {reply, {error, {no_contender, TargetNode}}, State};
+        true ->
+            _ = (catch Mod:stepped_down(CbState)),
+            {reply, {ok, Key, Token},
+             schedule_reconcile_after(settle_deadline_ms(),
+                                      State#state{role = follower,
+                                                  pending_transfer = true})}
+    end.
+
+%% The settle half: the committed per-item result decides what a prepared
+%% election does, mirroring `do_transfer_to/2`'s own arms. An unrecognised
+%% result (a batch-wide failure surfaced per key) is left to the reconcile
+%% backstop, which is why this stays total.
+do_settle_transfer(ok, State) ->
+    %% The key moved to the target: drop the lease and re-contend as a standby.
+    teardown_lease(State),
+    self() ! contend,
+    reset(State);
+do_settle_transfer({error, {no_contender, _}}, State) ->
+    %% Refused, and this node still holds the key on the same token: restore
+    %% the local work.
+    become_leader(State#state.token, State#state{pending_transfer = false});
+do_settle_transfer({error, not_owner}, State) ->
+    %% The lease lapsed during the command, so the key is already lost;
+    %% `stepped_down` ran in prepare, so re-contend without repeating it.
+    teardown_lease(State),
+    self() ! contend,
+    reset(State);
+do_settle_transfer({error, no_quorum}, State) ->
+    %% The batch command timed out: an unknown outcome for this key too. Move
+    %% to the state a timed-out `transfer_to/2` leaves (still pending, the
+    %% short reconcile armed) instead of waiting out the long settle deadline.
+    schedule_reconcile(State);
+do_settle_transfer(_Other, State) ->
+    State.
+
 %% The transfer pre-check: is `TargetNode` a live contender for `Key`? A local,
 %% possibly-stale read; a failed read counts as not ready, so the owner is
 %% never stepped down for an unconfirmed target.
@@ -404,7 +527,146 @@ reset(State) ->
 %% promotion well within the lease, rare enough to be a cheap backstop. Each
 %% timer carries a generation, so a re-contend supersedes any earlier pending
 %% reconcile rather than letting them accumulate.
-schedule_reconcile(#state{ttl_ms = TtlMs, reconcile = Gen} = State) ->
+schedule_reconcile(#state{ttl_ms = TtlMs} = State) ->
+    schedule_reconcile_after(max(TtlMs div 3, 1000), State).
+
+schedule_reconcile_after(DelayMs, #state{reconcile = Gen} = State) ->
     Next = Gen + 1,
-    _ = erlang:send_after(max(TtlMs div 3, 1000), self(), {reconcile, Next}),
+    _ = erlang:send_after(DelayMs, self(), {reconcile, Next}),
     State#state{reconcile = Next}.
+
+%%----------------------------------------------------------------------
+%% Batched transfer orchestration (used by `transfer_many/3`)
+%%----------------------------------------------------------------------
+
+%% A batch is chunked into commands of at most this many transfers, so one
+%% reconciliation pass costs a handful of log entries without any single entry
+%% growing without bound. Overridable via the app environment
+%% (`transfer_batch_chunk`).
+-define(BATCH_CHUNK, 500).
+
+%% The prepare fan-out deadline, matching `transfer_to/2`'s call bound.
+-define(PREPARE_TIMEOUT_MS, 15000).
+
+%% A prepared election's settle deadline: the prepare fan-out bound plus the
+%% command timeout, with margin, so the deadline cannot pass while the
+%% orchestrator may still commit. Overridable via the app environment
+%% (`transfer_settle_deadline_ms`).
+-define(SETTLE_DEADLINE_MS, 30000).
+
+settle_deadline_ms() ->
+    application:get_env(portunus, transfer_settle_deadline_ms,
+                        ?SETTLE_DEADLINE_MS).
+
+%% Keep the first target named for each key: results are looked up by key, so
+%% a duplicate key would alias another's result.
+dedup_by_key(KeyTargets) ->
+    {_, Rev} = lists:foldl(
+                 fun({Key, _Target} = KT, {Seen, Acc}) ->
+                         case is_map_key(Key, Seen) of
+                             true -> {Seen, Acc};
+                             false -> {Seen#{Key => true}, [KT | Acc]}
+                         end
+                 end, {#{}, []}, KeyTargets),
+    lists:reverse(Rev).
+
+%% Split the deduplicated pairs into elections to prepare and results already
+%% known: a key with no live election here is not owned by this node (as the
+%% single-transfer path answers it), and a managed key whose target is this
+%% node needs no transfer.
+classify(Deduped, LiveElections) ->
+    lists:foldr(
+      fun({Key, Target}, {Live, Immediate}) ->
+              case LiveElections of
+                  #{Key := _Pid} when Target =:= node() ->
+                      {Live, [{Key, ok} | Immediate]};
+                  #{Key := Pid} ->
+                      {[{Key, Pid, Target} | Live], Immediate};
+                  _ ->
+                      {Live, [{Key, {error, not_owner}} | Immediate]}
+              end
+      end, {[], []}, Deduped).
+
+chunked_transfer(_Name, []) ->
+    [];
+chunked_transfer(Name, Live) ->
+    Chunk = application:get_env(portunus, transfer_batch_chunk, ?BATCH_CHUNK),
+    lists:append([move_batch(Name, C) || C <- chunks(Chunk, Live)]).
+
+%% One chunk's three phases: prepare each election concurrently, commit the
+%% prepared transfers in one command, then settle each from its per-item
+%% result. A chunk that prepares nothing issues no command.
+move_batch(Name, Entries) ->
+    Prepared = prepare_all(Entries, ?PREPARE_TIMEOUT_MS),
+    Batch = [{LockKey, Token, Target}
+             || {_Key, _Pid, Target, {ok, LockKey, Token}} <- Prepared],
+    case Batch of
+        [] ->
+            [{Key, Res} || {Key, _Pid, _Target, {error, _} = Res} <- Prepared];
+        _ ->
+            settle_batch(Prepared, portunus:transfer_many(Name, Batch))
+    end.
+
+%% Run `prepare_transfer/2` on every election concurrently under one deadline,
+%% the way `stop_all/2` bounds many stops. A prepare that does not answer in
+%% time is treated as a refusal and its key drops from the batch; the election
+%% it may have prepared resolves itself through the reconcile backstop.
+%% Each prober carries its verdict as its exit reason, which dialyzer reads as
+%% a fun that never returns normally; that is the point.
+-dialyzer({nowarn_function, prepare_all/2}).
+prepare_all(Entries, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    Probes = [{Entry, spawn_monitor(
+                        fun() -> exit({prepared, prepare_call(Pid, Target)}) end)}
+              || {_Key, Pid, Target} = Entry <- Entries],
+    [await_prepare(Entry, Ref, Deadline) || {Entry, {_, Ref}} <- Probes].
+
+prepare_call(Pid, Target) ->
+    try prepare_transfer(Pid, Target)
+    catch exit:_ -> {error, no_quorum}
+    end.
+
+await_prepare({Key, Pid, Target}, Ref, Deadline) ->
+    Left = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'DOWN', Ref, process, _, {prepared, Result}} ->
+            {Key, Pid, Target, Result};
+        {'DOWN', Ref, process, _, _} ->
+            {Key, Pid, Target, {error, no_quorum}}
+    after Left ->
+        erlang:demonitor(Ref, [flush]),
+        {Key, Pid, Target, {error, no_quorum}}
+    end.
+
+%% A batch-wide `no_quorum` is an unknown outcome, not a failure. Settling
+%% each prepared election with it moves it to a timed-out `transfer_to/2`'s
+%% state (still pending, the short reconcile armed) rather than leaving it
+%% to wait out the long settle deadline.
+settle_batch(Prepared, {error, no_quorum}) ->
+    [begin
+         case Res of
+             {ok, _LockKey, _Token} -> settle_transfer(Pid, {error, no_quorum});
+             {error, _} -> ok
+         end,
+         {Key, batch_wide_result(Res)}
+     end || {Key, Pid, _Target, Res} <- Prepared];
+settle_batch(Prepared, Committed) when is_list(Committed) ->
+    Results = maps:from_list(Committed),
+    [settle_one(Entry, Results) || Entry <- Prepared].
+
+batch_wide_result({ok, _LockKey, _Token}) -> {error, no_quorum};
+batch_wide_result({error, _} = Err) -> Err.
+
+settle_one({Key, Pid, _Target, {ok, LockKey, _Token}}, Results) ->
+    ItemResult = maps:get(LockKey, Results, {error, no_quorum}),
+    settle_transfer(Pid, ItemResult),
+    {Key, ItemResult};
+settle_one({Key, _Pid, _Target, {error, _} = Err}, _Results) ->
+    {Key, Err}.
+
+%% Split a list into sublists of at most `N`, preserving order.
+chunks(N, List) when length(List) =< N ->
+    [List];
+chunks(N, List) ->
+    {Head, Tail} = lists:split(N, List),
+    [Head | chunks(N, Tail)].

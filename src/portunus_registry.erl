@@ -35,7 +35,7 @@ initially empty: the host re-adds its children, as it does after a node restart.
 -behaviour(portunus_election).
 
 -export([start_link/2, start_link/3, add/2, add/3, remove/2, sync/2, keys/1,
-         owned_keys/1, which_children/1, transfer/3, stop/1]).
+         owned_keys/1, which_children/1, transfer/3, transfer_many/2, stop/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 %% portunus_election callbacks
 -export([elected/1, stepped_down/1]).
@@ -178,6 +178,21 @@ return `{error, not_owner}`. Only the owner can transfer. If
 transfer(Server, Key, TargetNode) ->
     gen_server:call(Server, {transfer, Key, TargetNode}, infinity).
 
+-doc """
+Move several owned keys to their targets in one batched command: the batch
+equivalent of `transfer/3`.
+
+Each pair names a key and the node it should move to.
+
+Keys on the list that are not owned by the caller are ignored (not moved).
+
+Returns one `{Key, ok | {error, term()}}` per distinct key.
+""".
+-spec transfer_many(server(), [{term(), node()}]) ->
+    [{term(), portunus:ok_or_error(term())}].
+transfer_many(Server, KeyTargets) when is_list(KeyTargets) ->
+    gen_server:call(Server, {transfer_many, KeyTargets}, infinity).
+
 -spec stop(server()) -> ok.
 stop(Server) ->
     %% An already-stopped registry is this call's goal state, not an error.
@@ -235,6 +250,15 @@ handle_call({transfer, Key, TargetNode}, From,
             %% No live election here for the key: this node is not its owner.
             {reply, {error, not_owner}, State}
     end;
+handle_call({transfer_many, KeyTargets}, From,
+            #state{name = Name, elections = Elections} = State) ->
+    %% Offloaded to another process like `transfer` and `owned_keys`, freeing up the service one.
+    Live = #{Key => Pid || Key := {Pid, _Spec} <- Elections, is_pid(Pid)},
+    _ = spawn(fun() ->
+                      gen_server:reply(
+                        From, portunus_election:transfer_many(Name, KeyTargets, Live))
+              end),
+    {noreply, State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_call}, State}.
 

@@ -80,6 +80,7 @@ extend a lease by up to one full TTL (late expiry only, never early).
          integer()} |
         {release, lock_key(), token()} |
         {transfer, lock_key(), token(), owner()} |
+        {transfer_batch, [{lock_key(), token(), owner()}]} |
         {leave_queue, lock_key(), lease_id()} |
         {watch, lock_key(), pid()} |
         {unwatch, watch_ref()} |
@@ -273,20 +274,21 @@ do_apply(Meta, {release, LockKey, Token}, State0) ->
 %% equal to the holder returns `ok`, and a target with no live contender is
 %% refused.
 do_apply(Meta, {transfer, LockKey, Token, TargetOwner}, State0) ->
-    case maps:find(LockKey, State0#?MODULE.locks) of
-        {ok, LeaseId} ->
-            Lease = maps:get(LeaseId, State0#?MODULE.leases),
-            case maps:get(LockKey, Lease#lease.keys) of
-                #held_lock{token = Token, owner = TargetOwner} ->
-                    {State0, ok};
-                #held_lock{token = Token} ->
-                    do_transfer(Meta, LockKey, LeaseId, TargetOwner, State0);
-                #held_lock{} ->
-                    {State0, {error, not_owner}}
-            end;
-        error ->
-            {State0, {error, not_owner}}
-    end;
+    transfer_one(Meta, {LockKey, Token, TargetOwner}, State0);
+%% The batched form of `transfer`: one log entry moving many keys, folded in
+%% input order so an earlier item's promotion is visible to a later one. Each
+%% item returns its own result under its lock key. The `is_list/1` guard and
+%% `transfer_one/3`'s shape match answer a malformed item with `not_owner`
+%% rather than crashing, since a crash here is a poison pill every member
+%% replays.
+do_apply(Meta, {transfer_batch, Items}, State0) when is_list(Items) ->
+    {State, ResultsRev, GroupsRev} =
+        lists:foldl(
+          fun(Item, {S, Rs, Gs}) ->
+                  {S1, Result, Effs} = transfer_one(Meta, Item, S),
+                  {S1, [{item_key(Item), Result} | Rs], [Effs | Gs]}
+          end, {State0, [], []}, Items),
+    {State, lists:reverse(ResultsRev), lists:append(lists:reverse(GroupsRev))};
 %% Withdraw a lease's succession bid on one key: `release` for waiters. No
 %% token moves and no promotion runs, so the key's holder is untouched. A
 %% lease with no bid on the key (including the holder itself) gets
@@ -699,6 +701,33 @@ promote_waiter(Meta, LockKey, Revoking, State0, Effs) ->
             %% reflects the new owner, not a key that looks free.
             {State2, [incr(acquires_total, State2) | GrantEffs] ++ Effs ++ Effs1}
     end.
+
+%% One transfer, shared by the single `transfer` command and the
+%% `transfer_batch` fold, returning `{State, Result, Effects}`. It matches the
+%% item shape itself rather than relying on a command guard, so a malformed
+%% batch element is answered `not_owner` and never crashes `apply/3`.
+transfer_one(Meta, {LockKey, Token, TargetOwner}, State0) ->
+    case maps:find(LockKey, State0#?MODULE.locks) of
+        {ok, LeaseId} ->
+            Lease = maps:get(LeaseId, State0#?MODULE.leases),
+            case maps:get(LockKey, Lease#lease.keys) of
+                #held_lock{token = Token, owner = TargetOwner} ->
+                    {State0, ok, []};
+                #held_lock{token = Token} ->
+                    do_transfer(Meta, LockKey, LeaseId, TargetOwner, State0);
+                #held_lock{} ->
+                    {State0, {error, not_owner}, []}
+            end;
+        error ->
+            {State0, {error, not_owner}, []}
+    end;
+transfer_one(_Meta, _Item, State0) ->
+    {State0, {error, not_owner}, []}.
+
+%% A batch result is keyed by lock key; a malformed item has none, so it is
+%% keyed by the raw term, keeping the result list aligned with the input.
+item_key({LockKey, _Token, _TargetOwner}) -> LockKey;
+item_key(Item) -> Item.
 
 %% Targeted transfer: promote the highest-ranked live waiter whose owner is
 %% `TargetOwner`, removing the current holder in the same transition. The key

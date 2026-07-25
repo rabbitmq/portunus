@@ -15,10 +15,9 @@
 all() ->
     [apply_is_total].
 
-%% `apply/3` never raises, whatever the command: a known shape with
-%% ill-typed fields falls through the guards to `{error, unknown_command}`,
-%% and an unknown shape hits the catch-all. Totality is the poison-pill
-%% defence, so it is checked over arbitrary terms, not just curated ones.
+%% `apply/3` must return an error rather than raise on any term: a command
+%% that crashes it would crash every replica that replays the log. Hence the
+%% commands here are arbitrary terms, not just the expected ones.
 apply_is_total(_Config) ->
     true = portunus_test_helpers:quickcheck(fun prop_apply_is_total/0, 500).
 
@@ -46,6 +45,9 @@ command_gen() ->
             Field},
            {release, Field, Field},
            {transfer, Field, Field, Field},
+           {transfer_batch, list({Field, Field, Field})},
+           {transfer_batch, list(Field)},
+           {transfer_batch, Field},
            {leave_queue, Field, Field},
            {watch, Field, Field},
            {unwatch, Field},

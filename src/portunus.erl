@@ -44,6 +44,7 @@ target any member's replica (`reset_server/2`).
          leave_succession_queue/3,
          release/3,
          transfer/4,
+         transfer_many/2,
          contenders/2,
          owner/2]).
 
@@ -75,6 +76,9 @@ target any member's replica (`reset_server/2`).
 -include("portunus.hrl").
 
 -define(CMD_TIMEOUT, 5000).
+%% Backstops a pipelined command lost to a leader change. Generous, so a
+%% burst is drained rather than declared dead.
+-define(PIPELINE_CMD_TIMEOUT, 30_000).
 -define(MEMBERSHIP_CHANGE_RETRIES, 20).
 -define(MEMBERSHIP_CHANGE_RETRY_MS, 100).
 
@@ -1056,7 +1060,7 @@ grant_lease(Name, TtlMs, Opts)
 
 grant_lease1(Name, TtlMs, Opts) ->
     ProposedId = maps:get(proposed_id, Opts, undefined),
-    case cmd(Name, {grant_lease, ProposedId, TtlMs, self(), self()}) of
+    case pcmd(Name, {grant_lease, ProposedId, TtlMs, self(), self()}) of
         {ok, LeaseId} = Ok ->
             case maps:get(auto_renew, Opts, false) of
                 true ->
@@ -1135,7 +1139,7 @@ replica's state, every snapshot and every `owner/2` reply.
 -spec acquire(name(), lock_key(), lease_id(), owner(), term()) ->
     {ok, token()} | {error, acquire_error()}.
 acquire(Name, LockKey, LeaseId, Owner, Context) ->
-    cmd(Name, {acquire, LeaseId, LockKey, Owner, Context, nowait}).
+    pcmd(Name, {acquire, LeaseId, LockKey, Owner, Context, nowait}).
 
 -doc """
 Acquire `LockKey`, or join its succession queue if it is held. Returns
@@ -1161,7 +1165,7 @@ grant on promotion, as `acquire/5` does for an immediate grant.
 acquire_or_join_succession_queue(Name, LockKey, LeaseId, Owner, Opts) ->
     Score = succession_score(Name, LockKey, Opts),
     Context = maps:get(context, Opts, undefined),
-    cmd(Name, {acquire, LeaseId, LockKey, Owner, Context, wait, Score}).
+    pcmd(Name, {acquire, LeaseId, LockKey, Owner, Context, wait, Score}).
 
 %% The succession score: an affinity spec resolved over the current members,
 %% defaulting to 0 (FIFO). A faulty strategy degrades to FIFO; affinity is a
@@ -1293,6 +1297,26 @@ equal to the holder's own owner returns `ok`. If no live contender carries
     ok_or_error(transfer_error()).
 transfer(Name, LockKey, Token, TargetOwner) ->
     cmd(Name, {transfer, LockKey, Token, TargetOwner}).
+
+-doc """
+The batched form of `transfer/4`: move many held keys to their targets in one
+Ra command, for callers that already hold each key's token. Each item is
+checked independently, exactly as `transfer/4` checks a single one.
+
+A committed batch returns one result per input key, in order, each under its
+lock key and each the `ok`, `{error, not_owner}` or
+`{error, {no_contender, TargetOwner}}` a single transfer would return. A
+command that fails or times out returns a batch-wide `{error, no_quorum}`,
+never a per-item one, because the outcome is unknown for the whole batch and
+the caller retries the pass. An empty batch commits nothing and returns `[]`.
+""".
+-spec transfer_many(name(), [{lock_key(), token(), owner()}]) ->
+    [{lock_key(), ok_or_error(not_owner | {no_contender, owner()})}] |
+    {error, no_quorum}.
+transfer_many(_Name, []) ->
+    [];
+transfer_many(Name, Transfers) when is_list(Transfers) ->
+    cmd(Name, {transfer_batch, Transfers}).
 
 -doc """
 The live contenders queued for `LockKey`, as their `owner` terms, read from the
@@ -1556,6 +1580,64 @@ no_online_quorum(Name, Reason) ->
     ok = portunus_counters:incr(Name, failures_due_to_lack_of_online_quorum_total),
     logger:debug("portunus command on ~p rejected: ~p", [Name, Reason]),
     {error, no_quorum}.
+
+%% Pipelined submission for the contend commands. Under a mass rejoin,
+%% synchronous submission expires its call timeout faster than the leader
+%% applies, and every expired caller re-contends with a duplicate of a command
+%% that may still apply. Submitting once and waiting for the applied
+%% notification lets the burst drain instead of feeding itself.
+%%
+%% Same blocking contract as `cmd/2`. `low` priority, for Ra's batched
+%% appends under a burst. The reordering caveat on `low` does not bite: each
+%% caller awaits its reply before its next command, and cross-caller order is
+%% already fenced by the machine.
+pcmd(Name, Command) ->
+    Correlation = make_ref(),
+    ok = ra:pipeline_command(leader_or_local(Name), Command, Correlation, low),
+    Deadline = erlang:monotonic_time(millisecond) + pipeline_command_timeout(),
+    await_pipelined(Name, Command, Correlation, Deadline).
+
+%% Waits for one pipelined command's outcome and always answers. The answer
+%% is the applied reply, or `no_quorum` once the deadline passes.
+%%
+%% A rejection means the command was not appended. It is therefore safe to
+%% resubmit it, under the same correlation, to whichever leader the rejection
+%% names.
+%%
+%% Only a command lost with no rejection has no reply to wait for. That is an
+%% uncommitted entry on a leader change, and the deadline covers it.
+%%
+%% Notifications for other correlations belong to an earlier, abandoned wait
+%% and are skipped.
+await_pipelined(Name, Command, Correlation, Deadline) ->
+    Left = Deadline - erlang:monotonic_time(millisecond),
+    case Left =< 0 of
+        true ->
+            no_online_quorum(Name, timeout);
+        false ->
+            receive
+                {ra_event, _From, {applied, Applied}} ->
+                    case lists:keyfind(Correlation, 1, Applied) of
+                        {Correlation, Reply} ->
+                            Reply;
+                        false ->
+                            await_pipelined(Name, Command, Correlation, Deadline)
+                    end;
+                {ra_event, _From, {rejected, {not_leader, Leader, Correlation}}}
+                  when Leader =/= undefined ->
+                    ok = ra:pipeline_command(Leader, Command, Correlation, low),
+                    await_pipelined(Name, Command, Correlation, Deadline);
+                {ra_event, _From, {rejected, {not_leader, undefined, Correlation}}} ->
+                    no_online_quorum(Name, not_leader);
+                {ra_event, _From, {rejected, {not_leader, _, _Stale}}} ->
+                    await_pipelined(Name, Command, Correlation, Deadline)
+            after Left ->
+                no_online_quorum(Name, timeout)
+            end
+    end.
+
+pipeline_command_timeout() ->
+    application:get_env(portunus, pipeline_command_timeout, ?PIPELINE_CMD_TIMEOUT).
 
 query(Name, QueryMFA) ->
     case ra:consistent_query(leader_or_local(Name), QueryMFA, ?CMD_TIMEOUT) of
