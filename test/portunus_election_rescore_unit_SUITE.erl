@@ -38,8 +38,7 @@ init_per_testcase(_TC, Config) ->
     %% A registered mock for the shared renewer. Used so that the election's
     %% monitor on the name holds.
     %% This trick keeps the suite independent of application start order.
-    KA = spawn(fun idle/0),
-    register(portunus_batch_keepalive, KA),
+    KA = ensure_keepalive(),
     ?TAB = ets:new(?TAB, [named_table, public]),
     ets:insert(?TAB, {score, 1}),
     ok = meck:new(portunus, [passthrough, no_link]),
@@ -63,7 +62,25 @@ end_per_testcase(_TC, Config) ->
     catch meck:unload(portunus_batch_keepalive),
     catch meck:unload(portunus),
     catch ets:delete(?TAB),
-    catch exit(?config(keepalive, Config), kill),
+    stop_keepalive(?config(keepalive, Config)),
+    ok.
+
+%% Reuses an already-registered renewer (a full run leaves the real one
+%% up); spawns an idle stand-in only when the name is free.
+ensure_keepalive() ->
+    case whereis(portunus_batch_keepalive) of
+        undefined ->
+            KA = spawn(fun idle/0),
+            register(portunus_batch_keepalive, KA),
+            KA;
+        _Existing ->
+            existing
+    end.
+
+stop_keepalive(KA) when is_pid(KA) ->
+    catch exit(KA, kill),
+    ok;
+stop_keepalive(_) ->
     ok.
 
 %% After the score changes, the next reconciliation re-submits the bid carrying

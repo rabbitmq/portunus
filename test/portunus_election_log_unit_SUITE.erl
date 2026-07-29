@@ -29,8 +29,7 @@ all() ->
 
 init_per_testcase(_TC, Config) ->
     process_flag(trap_exit, true),
-    KA = spawn(fun idle/0),
-    register(portunus_batch_keepalive, KA),
+    KA = ensure_keepalive(),
     ok = meck:new(portunus, [passthrough, no_link]),
     ok = meck:new(portunus_batch_keepalive, [passthrough, no_link]),
     meck:expect(portunus_batch_keepalive, attach, fun(_N, _L, _T) -> ok end),
@@ -50,7 +49,25 @@ end_per_testcase(_TC, Config) ->
     ok = logger:set_primary_config(level, ?config(primary_level, Config)),
     catch meck:unload(portunus_batch_keepalive),
     catch meck:unload(portunus),
-    catch exit(?config(keepalive, Config), kill),
+    stop_keepalive(?config(keepalive, Config)),
+    ok.
+
+%% Reuses an already-registered renewer (a full run leaves the real one
+%% up); spawns an idle stand-in only when the name is free.
+ensure_keepalive() ->
+    case whereis(portunus_batch_keepalive) of
+        undefined ->
+            KA = spawn(fun idle/0),
+            register(portunus_batch_keepalive, KA),
+            KA;
+        _Existing ->
+            existing
+    end.
+
+stop_keepalive(KA) when is_pid(KA) ->
+    catch exit(KA, kill),
+    ok;
+stop_keepalive(_) ->
     ok.
 
 %% `elected/1` raises a reason carrying the marker: the warning names the
