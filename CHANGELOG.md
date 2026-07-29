@@ -1,6 +1,55 @@
-## Changes in `0.13.0` (in development)
+## Changes in `0.14.0` (in development)
 
 No changes yet.
+
+
+## Changes in `0.13.0` (Jul 29, 2026)
+
+### Enhancements
+
+ * Re-scoring for succession queue: contenders now periodically refresh
+   their score, so promotion ranks on current bids instead of bids frozen
+   at enqueue time. This is primarily important for the cases where
+   `dynamic` affinity is used: when a lease expires, the key now lands on the
+   node with the best current score, as it should.
+
+   This change is transparent and requires no application changes.
+
+ * Registry child identity: `portunus_registry` children can carry
+   inherently volatile state, such as credentials encrypted using
+   `credentials_obfuscation`. Previously there was no way to avoid churn
+   for such entities and now there is: they can provide a special
+   `identity` value that must be stable. The key is optional.
+
+   A code example:
+
+   ```erlang
+   Def = my_app:lookup_definition(Key),
+   Spec = #{id => Key,
+            start => {my_worker, start_link, [Key, obfuscate(Def)]},
+            restart => transient,
+            %% Stable across re-declares even though the encrypted
+            %% args above never compare equal
+            identity => erlang:phash2({Key, Def})},
+   ok = portunus_registry:add(Reg, Key, Spec).
+   ```
+
+   When both the stored and the candidate spec set an `identity`,
+   idempotence compares the identities instead of the specs, so a
+   re-declaration of an unchanged entity is a no-op and
+   `portunus_registry:sync/2` does not churn:
+
+   ```erlang
+   %% Entries whose identity did not change are not affected, no locks released,
+   %% no children restarted
+   ok = portunus_registry:sync(Reg, [spec_of(D) || D <- desired()]).
+   ```
+
+ * `portunus:ready_nodes/1`: the nodes holding at least one live
+   succession bid, the set of members a targeted transfer can move to
+
+ * The Ra state machine now declares a version (`1`), groundwork for
+   safe rolling upgrades across future machine changes
 
 
 ## Changes in `0.12.0` (Jul 25, 2026)
