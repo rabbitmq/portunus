@@ -48,14 +48,18 @@ before a restart.
 -type delayed_restart() :: {permanent | transient, number()}.
 -doc """
 Accepted input: a standard child spec (passed through untouched), or one
-carrying the extended restart, as a map or a `supervisor2` tuple.
+carrying the extended restart, as a map or a `supervisor2` tuple. A map
+spec may also carry `portunus_registry`'s registration `identity` key; it
+is removed here, so no supervisor ever sees it.
 """.
 -type child_spec_in() ::
         supervisor:child_spec()
-      | #{id := term(), start := mfargs(), restart := delayed_restart(),
+      | #{id := term(), start := mfargs(),
+          restart => permanent | transient | temporary | delayed_restart(),
           shutdown => timeout() | brutal_kill,
           type => worker | supervisor,
-          modules => [module()] | dynamic}
+          modules => [module()] | dynamic,
+          identity => term()}
       | {term(), mfargs(), delayed_restart(),
          timeout() | brutal_kill, worker | supervisor,
          [module()] | dynamic}.
@@ -64,6 +68,8 @@ carrying the extended restart, as a map or a `supervisor2` tuple.
 %% `supervisor2` accepts a delay of 0 (restart immediately) and float
 %% delays, so both forms are rewritten too.
 -spec child_spec(child_spec_in()) -> supervisor:child_spec().
+child_spec(#{identity := _} = Spec) ->
+    child_spec(maps:remove(identity, Spec));
 child_spec(#{restart := {Type, 0}} = Spec)
   when Type =:= permanent orelse Type =:= transient ->
     Spec#{restart => Type};

@@ -4,7 +4,8 @@
 // succession queue. Promotion is score-ranked with ties broken towards the
 // earlier candidate (lease id stands in for arrival order), matching the
 // machine's `{score, seq}` ranking; a re-enqueue refreshes the candidate's
-// bid. Mutual exclusion and fencing monotonicity must hold across every
+// score and keeps its arrival rank, as `enqueue_waiter/3` keeps the
+// original `seq`. Mutual exclusion and fencing monotonicity must hold across every
 // interleaving of grant, acquire, enqueue, queue leave, release, batch
 // expiry, and targeted transfer.
 // Release is token-fenced, as in the implementation: a release carrying a
@@ -152,7 +153,8 @@ module portunus_machine {
   }
 
   // A lease queues on a held key with a score; queueing again replaces its
-  // bid, as a re-acquire refreshes `{score, seq}` in the machine.
+  // score and keeps its arrival rank (the lease id), as a re-acquire
+  // refreshes the bid but keeps the original `seq` in the machine.
   action enqueue(l, k, s) = all {
     alive.contains(l),
     not(free(k)),

@@ -39,11 +39,14 @@ extend a lease by up to one full TTL (late expiry only, never early).
          state_enter/2,
          init_aux/1,
          handle_aux/5,
-         overview/1]).
+         overview/1,
+         version/0,
+         which_module/1]).
 
 %% Exported for queries run via `ra:consistent_query/3` or `ra:local_query/3`.
 -export([query_owner/2,
          query_contenders/2,
+         query_ready_nodes/1,
          query_status/1]).
 
 -export([token_info/1]).
@@ -86,7 +89,8 @@ extend a lease by up to one full TTL (late expiry only, never early).
         {unwatch, watch_ref()} |
         {expire_leases, [portunus_machine_aux:expire_pair()]} |
         {down, pid(), term()} |
-        {nodeup | nodedown, node()}.
+        {nodeup | nodedown, node()} |
+        {machine_version, ra_machine:version(), ra_machine:version()}.
 
 %% One held lock, kept under its lease.
 -record(held_lock, {token :: token(),
@@ -155,6 +159,18 @@ init(Config) ->
     #?MODULE{cluster = maps:get(cluster, Config, portunus),
              snapshot_interval = maps:get(snapshot_interval, Config,
                                           ?DEFAULT_SNAPSHOT_INTERVAL)}.
+
+%% The machine versioning baseline: version 1 is the first shipped
+%% machine, and the first post-release `apply/3` change bumps it, freezes
+%% this module, and gates the new behavior on the effective version.
+%% `which_module/1` is total over 0 and 1 because replaying an unversioned
+%% development log through the current module is the pre-release stance
+%% that produced this machine.
+-spec version() -> ra_machine:version().
+version() -> 1.
+
+-spec which_module(ra_machine:version()) -> module().
+which_module(_Version) -> ?MODULE.
 
 -spec apply(ra_machine:command_meta_data(), command(), state()) ->
     {state(), term(), ra_machine:effects()}.
@@ -350,6 +366,11 @@ do_apply(_Meta, {nodedown, _Node}, State0) ->
     %% Unreachable, not dead. Leases expire via the aux sweep if not
     %% renewed.
     {State0, ok};
+do_apply(_Meta, {machine_version, _From, _To}, State0) ->
+    %% Ra's version-raise command. The 0 to 1 conversion is the identity:
+    %% both versions run this module and there is no shipped version-0
+    %% state to convert. Also harmless as a client-forged command.
+    {State0, ok};
 do_apply(_Meta, _Unknown, State0) ->
     {State0, {error, unknown_command}}.
 
@@ -535,6 +556,18 @@ query_contenders(LockKey, State) ->
     [W#waiter.owner || W <- Ws,
                        maps:is_key(W#waiter.lease_id, State#?MODULE.leases)].
 
+%% The unique owners of live succession waiters across all keys: the set a
+%% targeted transfer can land on. Owners are opaque terms; only atoms are
+%% returned, the shape the batteries contend with (`node()`).
+-spec query_ready_nodes(state()) -> [node()].
+query_ready_nodes(State) ->
+    Leases = State#?MODULE.leases,
+    lists:usort([W#waiter.owner
+                 || _Key := Ws <- State#?MODULE.leader_succession_queue,
+                    W <- Ws,
+                    is_atom(W#waiter.owner),
+                    maps:is_key(W#waiter.lease_id, Leases)]).
+
 -spec query_status(state()) -> map().
 query_status(State) ->
     overview(State).
@@ -647,11 +680,20 @@ do_acquire(Meta, LeaseId, LockKey, Owner, Context, Wait, Score, State0) ->
             end
     end.
 
-%% A lease has at most one succession candidate per key: a re-acquire while queued
-%% refreshes its bid (score and seq) rather than adding a duplicate.
-enqueue_waiter(LockKey, #waiter{lease_id = LeaseId} = Waiter, State) ->
+%% A lease has at most one succession candidate per key: a re-acquire while
+%% queued replaces its bid (score, owner, and context) rather than adding a
+%% duplicate, keeping only the original arrival `seq`. A re-bid therefore
+%% never demotes the caller among equal scores. The kept `seq` is read from
+%% this state, so replay stays deterministic, and it remains unique per
+%% waiter (its original enqueue index), preserving the `seq`-keyed identity
+%% `promote_waiter/5` and `do_transfer/5` rely on.
+enqueue_waiter(LockKey, #waiter{lease_id = LeaseId} = Waiter0, State) ->
     Q = State#?MODULE.leader_succession_queue,
     Ws0 = maps:get(LockKey, Q, []),
+    Waiter = case [W || W <- Ws0, W#waiter.lease_id =:= LeaseId] of
+                 [Prev] -> Waiter0#waiter{seq = Prev#waiter.seq};
+                 [] -> Waiter0
+             end,
     Ws1 = [W || W <- Ws0, W#waiter.lease_id =/= LeaseId],
     State#?MODULE{leader_succession_queue =
                       maps:put(LockKey, [Waiter | Ws1], Q)}.

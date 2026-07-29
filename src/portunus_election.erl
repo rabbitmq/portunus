@@ -51,6 +51,9 @@ on external resources.
                 mod :: module(),
                 args :: term(),
                 affinity = default :: portunus_affinity:spec(),
+                %% The score last submitted with our bid; a re-bid is issued
+                %% only when a reconcile-time recomputation differs.
+                score :: portunus:option(integer()),
                 lease_id :: portunus:option(portunus:lease_id()),
                 %% Monitor on the shared renewer (`portunus_batch_keepalive`).
                 %% As long as owners can re-attach and monitor the renewer again
@@ -64,6 +67,9 @@ on external resources.
                 pending_transfer = false :: boolean(),
                 reconcile = 0 :: non_neg_integer()}).
 
+%% A `dynamic` affinity is re-scored at the reconcile cadence while the
+%% election waits, and a changed score refreshes its queued bid (see
+%% `portunus_affinity`).
 -type election_opts() :: #{ttl_ms => pos_integer(),
                            affinity => portunus_affinity:spec()}.
 -export_type([election_opts/0]).
@@ -246,11 +252,14 @@ handle_info(contend, State0) ->
                                               State0#state.ttl_ms),
         {ok, Mon} ?= attach_renewal(State0#state.name, LeaseId,
                                     State0#state.ttl_ms),
-        State1 = State0#state{lease_id = LeaseId, renewer_mon = Mon},
+        Score = portunus:succession_score(State0#state.name, State0#state.key,
+                                          #{affinity => State0#state.affinity}),
+        State1 = State0#state{lease_id = LeaseId, renewer_mon = Mon,
+                              score = Score},
         Owner = node(),
         case portunus:acquire_or_join_succession_queue(
                State1#state.name, State1#state.key, LeaseId, Owner,
-               #{affinity => State1#state.affinity}) of
+               #{score => Score}) of
             {ok, Token} ->
                 {noreply, become_leader(Token, State1)};
             {queued, _Depth} ->
@@ -293,29 +302,16 @@ handle_info(reattach,
   when LeaseId =/= undefined ->
     {noreply, reattach_renewal(State)};
 handle_info({reconcile, Gen}, #state{reconcile = Gen, role = follower,
-                                     name = Name, key = Key,
                                      lease_id = LeaseId} = State)
   when LeaseId =/= undefined ->
-    %% Backstop for a lost `granted` message. Promotion is committed in the
-    %% machine, but the notification is a best-effort `send_msg` that a leader
-    %% change can drop, leaving us queued forever while we already hold the
-    %% lock. A linearizable read settles it without touching the succession
-    %% queue (a re-acquire would reset our arrival order).
-    case portunus:owner(Name, Key) of
-        {ok, #{lease := LeaseId, token := Token}} ->
-            {noreply, become_leader(Token, State#state{pending_transfer = false})};
-        {error, no_quorum} ->
-            {noreply, schedule_reconcile(State)};
-        _ when State#state.pending_transfer ->
-            %% The timed-out transfer committed (or the key has since moved
-            %% on): this node no longer holds it, so drop the lease and
-            %% re-contend. `stepped_down` already ran before the command.
-            teardown_lease(State),
-            self() ! contend,
-            {noreply, reset(State)};
-        _ ->
-            {noreply, schedule_reconcile(State)}
-    end;
+    {noreply, reconcile(State)};
+handle_info({'EXIT', _Pid, _Reason}, State) ->
+    %% Exits from the parent are handled by gen_server before dispatch
+    %% (trap_exit is set for terminate/2). Links created by `elected/1`
+    %% callback code deliver here and are deliberately ignored: `elected/1`
+    %% runs in this process, and supervising whatever it links is the
+    %% callback's job.
+    {noreply, State};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -331,6 +327,71 @@ terminate(_Reason, #state{name = Name, lease_id = LeaseId})
 terminate(_Reason, _State) ->
     ok.
 
+%% Each reconcile round while queued answers two questions: does this node
+%% already own the key (a lost `granted`, a settled transfer), and is our
+%% queued bid still current? While a transfer outcome is pending only the
+%% ownership read runs: a re-bid's idempotent `{ok, Token}` would restart
+%% work a committed transfer is about to move, running it on two nodes.
+%% Otherwise the score is recomputed; when it changed, the re-bid replaces
+%% the read, because its reply answers the same ownership question.
+reconcile(#state{pending_transfer = true} = State) ->
+    reconcile_read(State);
+reconcile(#state{name = Name, key = Key, affinity = Affinity,
+                 score = Score} = State) ->
+    case portunus:succession_score(Name, Key, #{affinity => Affinity}) of
+        Score -> reconcile_read(State);
+        Changed -> rebid(Changed, State)
+    end.
+
+%% Backstop for a lost `granted` message. Promotion is committed in the
+%% machine, but the notification is a best-effort `send_msg` that a leader
+%% change can drop, leaving us queued forever while we already hold the
+%% lock. A linearizable read settles it without touching the succession
+%% queue.
+reconcile_read(#state{name = Name, key = Key, lease_id = LeaseId} = State) ->
+    case portunus:owner(Name, Key) of
+        {ok, #{lease := LeaseId, token := Token}} ->
+            become_leader(Token, State#state{pending_transfer = false});
+        {error, no_quorum} ->
+            schedule_reconcile(State);
+        _ when State#state.pending_transfer ->
+            %% The timed-out transfer committed (or the key has since moved
+            %% on): this node no longer holds it, so drop the lease and
+            %% re-contend. `stepped_down` already ran before the command.
+            teardown_lease(State),
+            self() ! contend,
+            reset(State);
+        _ ->
+            schedule_reconcile(State)
+    end.
+
+%% Re-submit our bid with the changed score; the machine refreshes it in
+%% place, keeping our arrival order. `{ok, Token}` means this node holds the
+%% key: a fresh grant, or a promotion whose `granted` message was lost.
+rebid(Score, #state{name = Name, key = Key, lease_id = LeaseId} = State) ->
+    case portunus:acquire_or_join_succession_queue(Name, Key, LeaseId, node(),
+                                                   #{score => Score}) of
+        {ok, Token} ->
+            become_leader(Token, State);
+        {queued, _Depth} ->
+            schedule_reconcile(State#state{score = Score});
+        {error, lease_expired} ->
+            %% A committed answer that the lease is gone: this election can
+            %% never be promoted, so re-contend now instead of waiting for
+            %% the renewal round's `lease_lost`.
+            teardown_lease(State),
+            self() ! contend,
+            reset(State);
+        {error, _} ->
+            %% Unknown outcome (a quorum loss, a timeout). Re-arm without
+            %% storing the score, so the next round retries the re-bid.
+            schedule_reconcile(State)
+    end.
+
+%% `elected/1` failure reasons and bad return values routinely embed the
+%% host's child arguments, and hosts put credentials there. The warning
+%% names the key and the failure class only; the user-supplied detail is a
+%% log-level change away at debug, not lost.
 become_leader(Token, #state{mod = Mod, name = Name, key = Key} = State) ->
     Ctx = #{name => Name, key => Key, token => Token, args => State#state.args},
     try Mod:elected(Ctx) of
@@ -340,15 +401,20 @@ become_leader(Token, #state{mod = Mod, name = Name, key = Key} = State) ->
             %% A bad return value raises `try_clause` outside this try's own
             %% protection, so it gets the same release-and-recontend path as
             %% an exception, not a crash.
-            logger:warning("portunus election ~p returned ~p from elected/1; "
-                           "releasing to re-contend", [Key, Other]),
+            logger:warning("portunus election ~p: elected/1 returned an "
+                           "unexpected value; releasing to re-contend", [Key]),
+            logger:debug("portunus election ~p: elected/1 returned ~p",
+                         [Key, Other]),
             defer_contend(State)
     catch
-        Class:Reason ->
-            %% The user's `elected/1` code could not start. Release the lock so another node
-            %% can win, rather than crash-looping with the lock held.
-            logger:warning("portunus election ~p failed to start (~p:~p); "
-                           "releasing to re-contend", [Key, Class, Reason]),
+        Class:Reason:Stacktrace ->
+            %% The user's `elected/1` code could not start. Release the lock
+            %% so another node can win, rather than crash-looping with the
+            %% lock held.
+            logger:warning("portunus election ~p: elected/1 raised ~p; "
+                           "releasing to re-contend", [Key, Class]),
+            logger:debug("portunus election ~p: elected/1 raised ~p:~p at ~p",
+                         [Key, Class, Reason, Stacktrace]),
             defer_contend(State)
     end.
 
@@ -520,7 +586,7 @@ reattach_renewal(#state{name = Name, lease_id = LeaseId,
 
 reset(State) ->
     State#state{role = follower, lease_id = undefined, renewer_mon = undefined,
-                token = undefined, cb_state = undefined,
+                token = undefined, cb_state = undefined, score = undefined,
                 pending_transfer = false}.
 
 %% Re-check ownership at the renewal cadence: often enough to recover a lost

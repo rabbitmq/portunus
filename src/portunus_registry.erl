@@ -112,6 +112,12 @@ cluster at any given time. Validated
 at registration: an invalid spec, a re-add with a different spec, or a
 child id already used under another key is an error, not a later
 elect-and-fail loop. Re-adding the identical spec is idempotent.
+
+A spec whose args differ on every computation (encrypted credentials are
+the common case) can carry an `identity` key: a term meaning "any two
+specs with this value start the same child". When both sides carry one,
+idempotence compares identities instead of specs. The key never reaches
+a supervisor.
 """.
 -spec add(server(), term(), portunus_delayed_restart:child_spec_in()) ->
     ok | {error, add_error()}.
@@ -134,6 +140,8 @@ set are removed (with `remove/2`'s semantics: this node stops contending,
 and ownership of a currently-owned key moves), and a changed spec is
 applied as remove then add. An unchanged spec is untouched, so a second
 `sync/2` with the same set is a no-op and causes no ownership churn.
+"Unchanged" compares `identity` keys when both sides have one (see
+`add/3`), so specs with non-deterministic arguments avoid some churn.
 Duplicate ids and invalid specs are refused before any change is applied.
 
 Built for reconciling children from an external source of truth: an
@@ -366,7 +374,7 @@ do_remove(Key, #state{elections = Elections, local_sup = LocalSup} = State) ->
 do_sync(Desired, #state{elections = Elections0} = State0) ->
     Remove = [K || K := {_, Spec} <- Elections0,
                    case Desired of
-                       #{K := Spec} -> false;
+                       #{K := DesiredSpec} -> not same_spec(Spec, DesiredSpec);
                        _ -> true
                    end],
     State1 = lists:foldl(fun do_remove/2, State0, Remove),
@@ -403,16 +411,32 @@ lock_key(Group, Key) -> {Group, Key}.
 %% rather than an endless elect-and-fail loop on whichever node wins.
 validate(Key, ChildSpec, Elections) ->
     case maps:find(Key, Elections) of
-        {ok, {_, ChildSpec}} ->
-            idempotent;
-        {ok, {_, _Other}} ->
-            {error, {already_added, Key}};
+        {ok, {_, Stored}} ->
+            case same_spec(Stored, ChildSpec) of
+                true -> idempotent;
+                false -> {error, {already_added, Key}}
+            end;
         error ->
             case validate_spec(ChildSpec) of
                 {ok, Id} -> unique_child_id(Id, Elections);
                 {error, _} = Err -> Err
             end
     end.
+
+%% Used to detect conditions when the same spec (object)
+%% is re-added or synced.
+%%
+%% Two specs register the same child when the host says so through
+%% matching `identity` keys.
+%%
+%% If only one or none of the sides have
+%% the identity key, the specs must be equal.
+%%
+%% In case of a match, the stored spec is kept.
+same_spec(#{identity := Stored}, #{identity := Offered}) ->
+    Stored =:= Offered;
+same_spec(Stored, Offered) ->
+    Stored =:= Offered.
 
 validate_spec(ChildSpec) ->
     try {child_id(ChildSpec),

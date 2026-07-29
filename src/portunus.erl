@@ -40,12 +40,14 @@ target any member's replica (`reset_server/2`).
 -export([acquire/4, acquire/5,
          acquire_or_join_succession_queue/4,
          acquire_or_join_succession_queue/5,
+         succession_score/3,
          acquire_with_timeout/5, acquire_with_timeout/6,
          leave_succession_queue/3,
          release/3,
          transfer/4,
          transfer_many/2,
          contenders/2,
+         ready_nodes/1,
          owner/2]).
 
 %% Watch.
@@ -101,9 +103,13 @@ target any member's replica (`reset_server/2`).
 %% `acquire_or_join_succession_queue/5` options. `affinity` decides which
 %% contender is promoted first (see `portunus_affinity`); the default is FIFO.
 %% `context` is attached to the grant on promotion, exactly as `acquire/5`
-%% attaches it to an "immediate" grant.
+%% attaches it to an "immediate" grant. `score` submits a precomputed bid
+%% and bypasses affinity resolution; it is internal to the batteries
+%% (`portunus_election` re-bids through it) and not part of the public
+%% contract.
 -type succession_opts() :: #{affinity => portunus_affinity:spec(),
-                             context => term()}.
+                             context => term(),
+                             score => integer()}.
 
 %% A watch registration handle from `watch/2`, passed to `unwatch/2` to stop watching.
 %% Epoch-packed Raft indices are used as watch references.
@@ -1167,10 +1173,17 @@ acquire_or_join_succession_queue(Name, LockKey, LeaseId, Owner, Opts) ->
     Context = maps:get(context, Opts, undefined),
     pcmd(Name, {acquire, LeaseId, LockKey, Owner, Context, wait, Score}).
 
-%% The succession score: an affinity spec resolved over the current members,
-%% defaulting to 0 (FIFO). A faulty strategy degrades to FIFO; affinity is a
-%% hint, not a correctness requirement. The raw integer `score` key is an
-%% internal escape hatch, deliberately absent from `succession_opts()`.
+-doc """
+The succession score `Opts` would submit for `Key`: an affinity spec
+resolved over the current members, defaulting to 0 (FIFO). A faulty
+strategy degrades to FIFO; affinity is a hint, not a correctness
+requirement.
+
+Exported for the batteries: `portunus_election` computes its score at the
+reconcile cadence and re-submits its bid when the score changed. Direct
+callers rarely need it.
+""".
+-spec succession_score(name(), lock_key(), succession_opts()) -> integer().
 succession_score(_Name, _Key, #{score := Score}) when is_integer(Score) ->
     Score;
 succession_score(_Name, _Key, #{affinity := default}) ->
@@ -1330,6 +1343,21 @@ contenders(Name, LockKey) ->
                         {portunus_machine, query_contenders, [LockKey]},
                         ?CMD_TIMEOUT) of
         {ok, {_IdxTerm, Owners}, _Leader} -> {ok, Owners};
+        _ -> {error, no_quorum}
+    end.
+
+-doc """
+The nodes holding at least one live succession bid: the set a targeted
+transfer can land on. Approximate, like `contenders/2`: read from the
+local replica, and a dead node lingers until its lease expires. Non-atom
+owners are left out.
+""".
+-spec ready_nodes(name()) -> {ok, [node()]} | {error, no_quorum}.
+ready_nodes(Name) ->
+    case ra:local_query({Name, node()},
+                        {portunus_machine, query_ready_nodes, []},
+                        ?CMD_TIMEOUT) of
+        {ok, {_IdxTerm, Nodes}, _Leader} -> {ok, Nodes};
         _ -> {error, no_quorum}
     end.
 

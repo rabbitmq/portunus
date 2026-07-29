@@ -20,6 +20,19 @@ Two strategies are supported:
     dynamically, such as metrics (load, resource consumption, and so on).
     Built-in variants: `metric`, `random`
 
+A score is computed by the contender at enqueue time and travels in the
+`acquire` command. While a contender waits, `portunus_election` recomputes
+the score at the reconcile cadence (a third of the lease TTL) and
+re-submits its bid when the score changed, so promotion ranks on scores at
+most one reconcile interval old. Direct users of
+`acquire_or_join_succession_queue/5` get no automatic refresh: their score
+stays as submitted until they re-acquire.
+
+A jittery `dynamic` strategy costs one command per queued key per reconcile
+interval, so keep the reported score quantized: report coarse integers that
+change when placement should, not raw samples. The built-in `metric`
+strategy already does.
+
 Affinity strategies are passed around as a `spec()` that carries a short
 name (`fifo`, `pinned`, `random`, and so on). To use a custom module,
 pass a `{Module, Args}` tuple where `Module` implements the `kind/0`
