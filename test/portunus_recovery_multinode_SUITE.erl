@@ -36,7 +36,11 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_testcase(_TC, Config) ->
-    [{cluster, portunus_ct_cluster:start(Config, ?NAME, 3)} | Config].
+    %% `stop_two` severs quorum and expects `no_quorum` within its call
+    %% window, not after the 30s production pipeline timeout, so shorten
+    %% that timeout on the cluster's nodes.
+    Opts = #{env => [{pipeline_command_timeout, 5000}]},
+    [{cluster, portunus_ct_cluster:start(Config, ?NAME, 3, Opts)} | Config].
 
 end_per_testcase(_TC, Config) ->
     portunus_ct_cluster:stop(?config(cluster, Config)).

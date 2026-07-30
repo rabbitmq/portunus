@@ -57,7 +57,11 @@ init_per_testcase(TC, Config) ->
                five_node_cluster_tolerates_two_failures -> 5;
                _ -> 3
            end,
-    [{cluster, portunus_ct_cluster:start(Config, ?NAME, Size)} | Config].
+    %% This suite severs quorum on purpose and asserts the write reports
+    %% `no_quorum` inside its call window, not after the 30s production
+    %% pipeline timeout, so shorten that timeout on the cluster's nodes.
+    Opts = #{env => [{pipeline_command_timeout, 5000}]},
+    [{cluster, portunus_ct_cluster:start(Config, ?NAME, Size, Opts)} | Config].
 
 end_per_testcase(_TC, Config) ->
     portunus_ct_cluster:stop(?config(cluster, Config)).

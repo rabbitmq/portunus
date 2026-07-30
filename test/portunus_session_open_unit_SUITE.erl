@@ -31,6 +31,9 @@ all() ->
 
 init_per_suite(Config) ->
     application:set_env(portunus, tick_interval_ms, 200),
+    %% The open against a missing cluster must report `no_quorum` inside the
+    %% caller's 15s wait, not after the 30s production pipeline timeout.
+    application:set_env(portunus, pipeline_command_timeout, 5000),
     DataDir = filename:join(?config(priv_dir, Config), "ra"),
     ok = filelib:ensure_dir(filename:join(DataDir, "x")),
     ok = portunus:start_system(?SYS, DataDir),

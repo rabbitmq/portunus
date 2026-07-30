@@ -27,6 +27,7 @@
 -define(SYS, portunus_cmd_return_sys).
 -define(NAME, portunus_cmd_return_test).
 -define(KEY, {res, k}).
+-define(LEASE, {res, lease}).
 -define(TTL, 60000).
 -define(REPLY_KEY, {?MODULE, stubbed_reply}).
 
@@ -59,11 +60,13 @@ end_per_testcase(_TC, _Config) ->
     ok.
 
 %% A bare `ok` from `ra:process_command/3` becomes `{error, no_quorum}`, the
-%% transient signal a caller retries, rather than crashing `grant_lease/2`.
+%% transient signal a caller retries, rather than crashing `cmd/3`. Exercised
+%% through `revoke_lease/2`, a command that still goes through `cmd/3`;
+%% `grant_lease/2` is now pipelined (`pcmd/2`) and no longer touches it.
 bare_ok_command_is_no_quorum(_Config) ->
     with_command_reply(ok,
         fun() ->
-                {error, no_quorum} = portunus:grant_lease(?NAME, ?TTL),
+                {error, no_quorum} = portunus:revoke_lease(?NAME, ?LEASE),
                 ok
         end).
 
@@ -102,7 +105,7 @@ prop_command_no_quorum() ->
     ?FORALL(Reply, unexpected_reply(),
             begin
                 persistent_term:put(?REPLY_KEY, Reply),
-                {error, no_quorum} =:= portunus:grant_lease(?NAME, ?TTL)
+                {error, no_quorum} =:= portunus:revoke_lease(?NAME, ?LEASE)
             end).
 
 prop_query_no_quorum() ->

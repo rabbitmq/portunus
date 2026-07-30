@@ -192,6 +192,10 @@ setup_cluster(Config, N) ->
               _ = peer:call(Peer, application, load, [portunus]),
               ok = peer:call(Peer, application, set_env,
                              [portunus, tick_interval_ms, ?TICK_MS]),
+              %% Report `no_quorum` within the isolated side's call window
+              %% rather than after the 30s production pipeline timeout.
+              ok = peer:call(Peer, application, set_env,
+                             [portunus, pipeline_command_timeout, 5000]),
               DataDir = filename:join([PrivDir, atom_to_list(Node)]),
               ok = peer:call(Peer, portunus, start_system, [?SYS, DataDir])
       end, Peers),
