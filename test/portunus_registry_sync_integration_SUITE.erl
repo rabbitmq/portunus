@@ -19,7 +19,8 @@
 -export([sync_reconciles_the_set/1,
          sync_is_idempotent/1,
          sync_applies_a_changed_spec/1,
-         sync_refuses_duplicates_and_invalid_specs/1]).
+         sync_refuses_duplicates_and_invalid_specs/1,
+         validate_spec_filter_agrees_with_sync/1]).
 -export([start_worker/1]).
 
 -define(SYS, portunus_registry_sync_int_sys).
@@ -30,7 +31,8 @@ all() ->
     [sync_reconciles_the_set,
      sync_is_idempotent,
      sync_applies_a_changed_spec,
-     sync_refuses_duplicates_and_invalid_specs].
+     sync_refuses_duplicates_and_invalid_specs,
+     validate_spec_filter_agrees_with_sync].
 
 init_per_suite(Config) ->
     application:set_env(portunus, tick_interval_ms, 200),
@@ -112,6 +114,29 @@ sync_refuses_duplicates_and_invalid_specs(_Config) ->
     %% Refused before any change: the existing registration is untouched.
     ?assertEqual([keep], portunus_registry:keys(Reg)),
     ?assertEqual(Kept, whereis(rs_w_keep)),
+    ok = portunus_registry:stop(Reg).
+
+%% The contract `validate_spec/1` is exported with/for: a set filtered through
+%% it (invalid specs and duplicate ids dropped) is never refused by
+%% `sync/2` for spec validity.
+validate_spec_filter_agrees_with_sync(_Config) ->
+    {ok, Reg} = portunus_registry:start_link(?NAME, #{ttl_ms => ?TTL}),
+    Mixed = [spec(agree_a, rs_w_va),
+             garbage,
+             #{id => broken},
+             spec(agree_b, rs_w_vb),
+             spec(agree_b, rs_w_vb2)],
+    {Filtered, _Ids} =
+        lists:foldl(fun(Spec, {Acc, Seen}) ->
+                            case portunus_registry:validate_spec(Spec) of
+                                {ok, Id} when not is_map_key(Id, Seen) ->
+                                    {[Spec | Acc], Seen#{Id => true}};
+                                _ ->
+                                    {Acc, Seen}
+                            end
+                    end, {[], #{}}, Mixed),
+    ?assertEqual(ok, portunus_registry:sync(Reg, lists:reverse(Filtered))),
+    ?assertEqual([agree_a, agree_b], lists:sort(portunus_registry:keys(Reg))),
     ok = portunus_registry:stop(Reg).
 
 %%----------------------------------------------------------------------

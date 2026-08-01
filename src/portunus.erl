@@ -820,10 +820,11 @@ converge(System, Name, Seed, Members) ->
                     maybe_trigger_single_member_election(ServerId, LocalMembers),
                     ok;
                 {true, true} ->
-                    case lists:member({Name, Seed}, LocalMembers) of
-                        true -> ok;
-                        false -> merge_into_seed(System, Name, Seed, ServerId)
-                    end
+                    %% Always ask the seed. The local view can be stale: a
+                    %% view that still carries a seed that re-formed on a
+                    %% wiped disk would otherwise pass forever, and this
+                    %% node would never rejoin.
+                    merge_into_seed(System, Name, Seed, ServerId)
             end;
         _ ->
             %% Local query timed out. Retry rather than joining "as is", so a

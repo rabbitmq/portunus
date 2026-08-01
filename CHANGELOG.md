@@ -1,6 +1,33 @@
 ## Changes in `0.14.0` (in development)
 
-No changes yet.
+### Breaking or Potentially Breaking Changes
+
+ * `join_or_form/3` on an established member now asks the seed instead of
+   trusting the local member view. When the seed's server is down it returns
+   `{error, seed_unreachable}` where it previously returned `ok`. Nothing
+   is reset in either case. Simply retry until the seed is back
+
+### Enhancements
+
+ * `portunus_joiner`: a battery that runs the cluster join loop: retries
+   with backoff, a `recheck/1` trigger, and a periodic membership
+   re-check. Reports `{portunus_joiner, Name, joined | rejoining}` to a
+   subscriber
+
+ * `portunus_registry:validate_spec/1` is now exported. `sync/2` refuses
+   the entire set when one spec is invalid, so a caller that wants to
+   sync the valid specs and report the rest has to validate each spec
+   first. Now apps won't have to reinvent this wheel
+
+ * A Quint model of cluster formation (`quint/portunus_bootstrap.qnt`).
+   Its first run found the bug fixed below
+
+### Bug Fixes
+
+ * A node whose on-disk member view still carried the seed was never
+   repaired after the seed lost its disk and re-formed without it:
+   `join_or_form/3` reported success without rejoining, leaving the node
+   outside the cluster
 
 
 ## Changes in `0.13.0` (Jul 29, 2026)

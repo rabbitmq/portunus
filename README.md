@@ -96,6 +96,21 @@ call `join_or_form/3` with the same full member list on every node from
 a retry loop: every node picks the same seed, so two nodes can never
 each form their own cluster.
 
+`portunus_joiner` is that retry loop as a feature provided by `portunus`. It retries the join
+with backoff, re-checks membership when asked (`recheck/1`) and
+periodically on its own, and reports `joined` and `rejoining` to a
+subscriber:
+
+```erlang
+{ok, Joiner} = portunus_joiner:start_link(
+                 #{system => portunus, name => my_locks,
+                   candidates => fun() -> my_app:cluster_nodes() end}).
+```
+
+Wait for `joined` before registering children, and do not stop anything
+on `rejoining`: it is often a false alarm, and leases protect running
+children.
+
 ## Locks and Leases
 
 The core API grants a lease, then acquires keys under it. Every grant
@@ -445,6 +460,8 @@ and heals a first-boot split.
    added and removed at runtime
  * `portunus_batch_keepalive`: a per-node renewer that batches lease
    renewals sharing a cluster and TTL into one Ra command per round
+ * `portunus_joiner`: owns the join and convergence loop around
+   `join_or_form/3`, with a periodic membership re-check
  * `portunus_affinity`: placement strategies for succession, built-in
    and custom
  * `portunus_counters`: seshat metrics

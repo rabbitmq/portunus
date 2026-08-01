@@ -16,7 +16,8 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
--export([leaderless_empty_seed_reaches_full_membership/1]).
+-export([leaderless_empty_seed_reaches_full_membership/1,
+         stale_view_of_reformed_seed_merges/1]).
 
 -define(SYS, portunus).
 -define(NAME, portunus_seed_recovery_multinode_test).
@@ -24,7 +25,8 @@
 -define(RETRIES, 100).
 
 all() ->
-    [leaderless_empty_seed_reaches_full_membership].
+    [leaderless_empty_seed_reaches_full_membership,
+     stale_view_of_reformed_seed_merges].
 
 init_per_suite(Config) ->
     case portunus_ct_cluster:ensure_distribution() of
@@ -60,6 +62,27 @@ leaderless_empty_seed_reaches_full_membership(Config) ->
     ?assertEqual(?SIZE, portunus_ct_cluster:member_count(Nodes, ?NAME)),
     {?NAME, _} = portunus_ct_cluster:wait_leader(Nodes, ?NAME).
 
+%% The seed forms a cluster with the third node, loses its disk, and
+%% re-forms alone. The third node's on-disk view still lists the seed, so
+%% before the fix `converge` answered ok forever and the node never
+%% rejoined. Found by quint/portunus_bootstrap.qnt.
+stale_view_of_reformed_seed_merges(Config) ->
+    #{nodes := Nodes} = ?config(cluster, Config),
+    [Seed, Second, Third] = lists:sort(Nodes),
+    ok = converge_all([Seed, Third], [Seed, Third], ?RETRIES),
+    %% The seed's disk is lost while the third node is up.
+    ok = rpc:call(Seed, ra, stop_server, [?SYS, {?NAME, Seed}]),
+    ok = rpc:call(Seed, ra, force_delete_server, [?SYS, {?NAME, Seed}]),
+    %% The seed re-forms alone (its host view is partial) and the second
+    %% node joins it.
+    ok = rpc:call(Seed, portunus, join_or_form, [?SYS, ?NAME, [Seed]]),
+    ok = converge_all([Seed, Second], [Seed, Second], ?RETRIES),
+    %% The third node's view is now stale: it carries the seed, the
+    %% seed's cluster does not carry it. Its passes alone must repair it.
+    ok = converge_all(Nodes, [Third], ?RETRIES),
+    ?assertEqual(?SIZE, portunus_ct_cluster:member_count(Nodes, ?NAME)),
+    {?NAME, _} = portunus_ct_cluster:wait_leader(Nodes, ?NAME).
+
 %%----------------------------------------------------------------------
 %% Helpers
 %%----------------------------------------------------------------------
@@ -71,11 +94,16 @@ form_without_election(Node) ->
                #{cluster => ?NAME, tick_interval_ms => 1000, snapshot_interval => 4096}},
     ok = rpc:call(Node, ra, start_server, [?SYS, ?NAME, ServerId, Machine, [ServerId]]).
 
-converge_all(Nodes, 0) ->
-    ct:fail({converge_timed_out, Nodes});
 converge_all(Nodes, Retries) ->
-    _ = [rpc:call(N, portunus, join_or_form, [?SYS, ?NAME, Nodes]) || N <- Nodes],
-    case portunus_ct_cluster:member_count(Nodes, ?NAME) =:= length(Nodes) of
+    converge_all(Nodes, Nodes, Retries).
+
+%% `join_or_form/3` with `Members` on the `RunOn` nodes only, until the
+%% cluster carries every member.
+converge_all(Members, _RunOn, 0) ->
+    ct:fail({converge_timed_out, Members});
+converge_all(Members, RunOn, Retries) ->
+    _ = [rpc:call(N, portunus, join_or_form, [?SYS, ?NAME, Members]) || N <- RunOn],
+    case portunus_ct_cluster:member_count(Members, ?NAME) =:= length(Members) of
         true -> ok;
-        false -> timer:sleep(100), converge_all(Nodes, Retries - 1)
+        false -> timer:sleep(100), converge_all(Members, RunOn, Retries - 1)
     end.

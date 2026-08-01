@@ -13,7 +13,8 @@
 -include_lib("common_test/include/ct.hrl").
 
 -export([all/0, init_per_suite/1, end_per_suite/1]).
--export([add_validates_specs/1,
+-export([validate_spec_accepts_and_refuses/1,
+         add_validates_specs/1,
          re_add_semantics/1,
          remove_in_backoff_cancels_restart/1,
          owned_keys_survives_blocked_elections/1,
@@ -31,7 +32,8 @@
 -define(TTL, 2000).
 
 all() ->
-    [add_validates_specs,
+    [validate_spec_accepts_and_refuses,
+     add_validates_specs,
      re_add_semantics,
      remove_in_backoff_cancels_restart,
      owned_keys_survives_blocked_elections,
@@ -52,6 +54,27 @@ init_per_suite(Config) ->
 end_per_suite(_Config) ->
     catch ra:stop_server(?SYS, {?NAME, node()}),
     ok.
+
+validate_spec_accepts_and_refuses(_Config) ->
+    ?assertEqual({ok, vs_ok},
+                 portunus_registry:validate_spec(worker_spec(vs_ok, rh_vs1))),
+    %% The extended `{permanent, Delay}` restart, in both accepted forms.
+    Delayed = (worker_spec(vs_delayed, rh_vs2))#{restart => {permanent, 5}},
+    ?assertEqual({ok, vs_delayed}, portunus_registry:validate_spec(Delayed)),
+    Tuple = {vs_tuple, {?MODULE, start_worker, [rh_vs3]},
+             {permanent, 5}, 5000, worker, [?MODULE]},
+    ?assertEqual({ok, vs_tuple}, portunus_registry:validate_spec(Tuple)),
+    ?assertMatch({error, {invalid_child_spec, _}},
+                 portunus_registry:validate_spec(garbage)),
+    %% A map without an id makes the id extraction itself raise.
+    ?assertMatch({error, {invalid_child_spec, _}},
+                 portunus_registry:validate_spec(
+                   #{start => {?MODULE, start_worker, [rh_vs4]}})),
+    %% A supervisor2 restart type the rewriter does not accept.
+    ?assertMatch({error, {invalid_child_spec, _}},
+                 portunus_registry:validate_spec(
+                   {vs_bad, {?MODULE, start_worker, [rh_vs5]},
+                    {intrinsic, 5}, 5000, worker, [?MODULE]})).
 
 add_validates_specs(_Config) ->
     {ok, Reg} = portunus_registry:start_link(?NAME, #{ttl_ms => ?TTL}),

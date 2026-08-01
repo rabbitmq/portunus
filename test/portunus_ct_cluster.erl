@@ -297,9 +297,11 @@ cluster_info([Node | Rest], All, Name) ->
 
 -spec member_count([node()], atom()) -> non_neg_integer().
 member_count(Nodes, Name) ->
+    %% `{'EXIT', _}` must be matched before the success tuple: both are
+    %% 2-tuples, and no member responding is a count of zero, not a crash.
     case catch cluster_info(Nodes, Name) of
-        {Members, _} -> length(Members);
-        _ -> 0
+        {'EXIT', _} -> 0;
+        {Members, _} -> length(Members)
     end.
 
 %% Wait until every node in `Nodes` reports the same leader and that leader is

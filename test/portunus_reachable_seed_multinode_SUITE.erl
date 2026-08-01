@@ -84,7 +84,9 @@ returning_seed_joins_existing_cluster(Config) ->
                  rpc:call(Low, portunus, owner, [?NAME, {res, hold}])).
 
 %% The seed's Ra server stops but its node stays up, so it stays reachable and the
-%% effective seed. Convergence must not reset an established member.
+%% effective seed. Convergence must not reset an established member: the pass
+%% reports the seed unreachable, and succeeds again once the seed's server
+%% is back.
 blip_of_reachable_seed_does_not_reset_member(Config) ->
     #{nodes := Nodes} = ?config(cluster, Config),
     Seed = hd(lists:sort(Nodes)),
@@ -93,10 +95,18 @@ blip_of_reachable_seed_does_not_reset_member(Config) ->
     {?NAME, _} = portunus_ct_cluster:wait_leader(Nodes, ?NAME),
     Token = place_lock(Member, {res, hold}),
     ok = portunus_ct_cluster:stop_ra_server(Seed, ?NAME),
-    ?assertEqual(ok, rpc:call(Member, portunus, join_or_form, [?SYS, ?NAME, Nodes])),
+    ?assertEqual({error, seed_unreachable},
+                 rpc:call(Member, portunus, join_or_form, [?SYS, ?NAME, Nodes])),
     ?assertEqual(?SIZE, portunus_ct_cluster:member_count(Nodes, ?NAME)),
     ?assertMatch({ok, #{owner := owner_a, token := Token}},
-                 rpc:call(Member, portunus, owner, [?NAME, {res, hold}])).
+                 rpc:call(Member, portunus, owner, [?NAME, {res, hold}])),
+    ok = rpc:call(Seed, ra, restart_server, [?SYS, {?NAME, Seed}]),
+    %% Polled: the restarted replica needs a moment to learn the leader.
+    ok = portunus_ct_cluster:wait_until(
+           fun() ->
+                   rpc:call(Member, portunus, join_or_form,
+                            [?SYS, ?NAME, Nodes]) =:= ok
+           end).
 
 %% Only the local node is reachable, so the effective seed has no cluster to join
 %% and forms solo.

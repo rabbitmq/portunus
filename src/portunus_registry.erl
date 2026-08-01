@@ -35,7 +35,8 @@ initially empty: the host re-adds its children, as it does after a node restart.
 -behaviour(portunus_election).
 
 -export([start_link/2, start_link/3, add/2, add/3, remove/2, sync/2, keys/1,
-         owned_keys/1, which_children/1, transfer/3, transfer_many/2, stop/1]).
+         owned_keys/1, which_children/1, transfer/3, transfer_many/2, stop/1,
+         validate_spec/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 %% portunus_election callbacks
 -export([elected/1, stepped_down/1]).
@@ -438,6 +439,21 @@ same_spec(#{identity := Stored}, #{identity := Offered}) ->
 same_spec(Stored, Offered) ->
     Stored =:= Offered.
 
+-doc """
+Validate a child spec with the same check `add/3` and `sync/2` apply,
+returning the child id of a valid spec.
+
+`sync/2` refuses the entire set when one spec is invalid or two specs
+share a child id, so a caller that wants to sync the valid specs and
+report the rest validates each spec first with this function, using the
+returned id to drop duplicates.
+
+Any term is accepted. Anything but a valid
+`t:portunus_delayed_restart:child_spec_in/0` is an `invalid_child_spec`
+error.
+""".
+-spec validate_spec(term()) ->
+    {ok, ChildId :: term()} | {error, {invalid_child_spec, term()}}.
 validate_spec(ChildSpec) ->
     try {child_id(ChildSpec),
          portunus_delayed_restart:child_spec(ChildSpec)} of

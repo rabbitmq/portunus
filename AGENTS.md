@@ -65,6 +65,8 @@ Batteries (client-side extras, no new replicated state):
    rate-limited standard child spec
  * `portunus_local_sup`: the local supervisor an elected owner boots
    children into
+ * `portunus_joiner`: owns the consumer-side join and convergence loop
+   around `join_or_form/3`, with a periodic membership re-check
 
 ## State Machine Invariants (do not break)
 

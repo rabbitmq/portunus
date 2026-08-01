@@ -131,7 +131,9 @@ merges_multi_member_cluster_excluding_seed(Config) ->
                  rpc:call(Seed, portunus, owner, [?NAME, {res, gone}])).
 
 %% With the seed's server stopped, convergence on an established multi-member
-%% member does not reset it.
+%% member does not reset it. Membership cannot be confirmed without the seed,
+%% so the pass reports the seed unreachable and succeeds again once the
+%% seed's server is back.
 established_member_is_never_reset(Config) ->
     #{nodes := Nodes} = ?config(cluster, Config),
     Seed = seed(Nodes),
@@ -140,11 +142,18 @@ established_member_is_never_reset(Config) ->
     {?NAME, _} = portunus_ct_cluster:wait_leader(Nodes, ?NAME),
     Token = place_lock(Member, {res, hold}),
     ok = portunus_ct_cluster:stop_ra_server(Seed, ?NAME),
-    ?assertEqual(ok,
+    ?assertEqual({error, seed_unreachable},
                  rpc:call(Member, portunus, join_or_form, [?SYS, ?NAME, Nodes])),
     ?assertEqual(?SIZE, portunus_ct_cluster:member_count(Nodes, ?NAME)),
     ?assertMatch({ok, #{owner := owner_a, token := Token}},
-                 rpc:call(Member, portunus, owner, [?NAME, {res, hold}])).
+                 rpc:call(Member, portunus, owner, [?NAME, {res, hold}])),
+    ok = rpc:call(Seed, ra, restart_server, [?SYS, {?NAME, Seed}]),
+    %% Polled: the restarted replica needs a moment to learn the leader.
+    ok = portunus_ct_cluster:wait_until(
+           fun() ->
+                   rpc:call(Member, portunus, join_or_form,
+                            [?SYS, ?NAME, Nodes]) =:= ok
+           end).
 
 %% A second convergence pass on the merged cluster changes nothing and keeps the
 %% lock.
