@@ -1,4 +1,9 @@
-## Changes in `0.14.0` (in development)
+## Changes in `0.15.0` (in development)
+
+No changes yet.
+
+
+## Changes in `0.14.0` (Aug 1, 2026)
 
 ### Breaking or Potentially Breaking Changes
 
@@ -18,16 +23,6 @@
    the entire set when one spec is invalid, so a caller that wants to
    sync the valid specs and report the rest has to validate each spec
    first. Now apps won't have to reinvent this wheel
-
- * A Quint model of cluster formation (`quint/portunus_bootstrap.qnt`).
-   Its first run found the bug fixed below
-
-### Bug Fixes
-
- * A node whose on-disk member view still carried the seed was never
-   repaired after the seed lost its disk and re-formed without it:
-   `join_or_form/3` reported success without rejoining, leaving the node
-   outside the cluster
 
 
 ## Changes in `0.13.0` (Jul 29, 2026)
